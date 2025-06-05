@@ -21,6 +21,10 @@ NORMAL_GROUP="amei"
 mkdir -p "$(dirname "$LOG_FILE")"
 touch "$LOG_FILE"
 
+# 初始化去抖计时器
+LAST_LINUX_EVENT=0
+LAST_PERMISSION_RESET=0
+
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
 }
@@ -54,7 +58,12 @@ acquire_lock() {
         log "⛔ 等待锁定超时，放弃同步: $1"
         return 1
     fi
+    touch "$LOCK_FILE"
     return 0
+}
+
+release_lock() {
+    rm -f "$LOCK_FILE"
 }
 
 # --- 权限处理函数 (Linux - 简化版，但使用默认 ACL) ---
@@ -62,9 +71,6 @@ fix_linux_permissions() {
     local target_dir="$1"
     log "🔧 正在为 Linux 目录 '$target_dir' 应用权限 (用户: $NORMAL_USER, 用户组: $NORMAL_GROUP)"
 
-    # 确保 NORMAL_USER 拥有所有文件。如果脚本不是以 root 运行，可能需要 sudo。
-    # 如果以 NORMAL_USER 身份运行，并且文件已归 NORMAL_USER 所有，则 chown/chmod 不需要 sudo。
-    # 但 setfacl 通常需要 sudo。
     local SUDO_CMD=""
     if [ "$(id -u)" -ne 0 ] && ! (sudo -n true 2>/dev/null); then # 检查是否非 root 且无法免密 sudo
       log "⚠️ 警告: 当前非 root 用户，且 sudo -n 不可用。权限可能无法完全应用。"
@@ -82,8 +88,6 @@ fix_linux_permissions() {
 
 
     # 设置默认 ACL: 在 $target_dir 中新创建的文件/目录将继承这些权限。
-    # u:NORMAL_USER:rwx, g:NORMAL_GROUP:r-x (组用户读和执行), o::r-x (其他用户读和执行)
-    # 如果你的组需要写权限，请修改。
     if command -v setfacl >/dev/null; then # 检查 setfacl 命令是否存在
         $SUDO_CMD setfacl -R -b "$target_dir" 2>/dev/null # 清理已存在的 ACL
         $SUDO_CMD setfacl -R -d -m "u:$NORMAL_USER:rwx,g:$NORMAL_GROUP:rx,o::rx" "$target_dir" # 设置默认ACL
@@ -95,26 +99,21 @@ fix_linux_permissions() {
 }
 
 sync_linux_to_win() {
+    local current_time
+    current_time=$(date +%s)
+    local elapsed=$((current_time - LAST_LINUX_EVENT))
+
+    # 去抖机制：1秒内的事件合并处理
+    if [[ $elapsed -lt 1 && $LAST_LINUX_EVENT -ne 0 ]]; then
+        log "⏱️ 合并连续事件（${elapsed}秒内）"
+        return
+    fi
+    LAST_LINUX_EVENT=$current_time
+
     if ! acquire_lock "Linux → Windows"; then
         return
     fi
-
-    # 添加去抖计时器
-    if [ -z "$last_linux_event" ]; then
-        last_linux_event=$(date +%s)
-    else
-        current_time=$(date +%s)
-        elapsed=$((current_time - last_linux_event))
-
-        # 如果1秒内有连续事件，合并处理
-        if [ $elapsed -lt 1 ]; then
-            log "⏱️ 合并连续事件（${elapsed}秒内）"
-            return
-        fi
-        last_linux_event=$current_time
-    fi
     
-    touch "$LOCK_FILE"
     log "🔄 开始同步: Linux → Windows"
     
     # shellcheck disable=SC2068
@@ -134,8 +133,8 @@ sync_linux_to_win() {
     else
         log "❌ 同步失败 [代码 $exit_code]: Linux → Windows"
     fi
-    
-    rm -f "$LOCK_FILE"
+ 
+    release_lock   
 }
 
 sync_win_to_linux() {
@@ -143,7 +142,6 @@ sync_win_to_linux() {
         return
     fi
     
-    touch "$LOCK_FILE"
     log "🔄 开始同步: Windows → Linux"
 
     local rsync_output_file
@@ -157,14 +155,23 @@ sync_win_to_linux() {
           ${RSYNC_EXCLUDES[@]} \
           "$SSH_USER@$SSH_HOST:$WIN_CYGDRIVE_PATH/" \
           "$LINUX_DIR/" > "$rsync_output_file" | tee -a "$LOG_FILE"
-    
+
     local exit_code=${PIPESTATUS[0]}
     if [ $exit_code -eq 0 ]; then
         log "✅ 同步成功: Windows → Linux"
         
         if grep -q -v -e '^sending incremental file list' -e '^sent .* bytes  received .* bytes' -e '^total size is .* speedup is' "$rsync_output_file"; then
-            fix_linux_permissions "$LINUX_DIR"
-            last_permission_reset=$(date +%s)
+            local current_time
+            current_time=$(date +%s)
+            local elapsed=$((current_time - LAST_PERMISSION_RESET))
+            
+            # 限制权限修复频率（至少1分钟一次）
+            if [[ $elapsed -gt 60 ]]; then
+                fix_linux_permissions "$LINUX_DIR"
+                LAST_PERMISSION_RESET=$current_time
+            else
+                log "⏳ 跳过权限修复（上次修复 ${elapsed} 秒前）"
+            fi
         else
             log "🔩 未检测到从 Windows 实际传输文件数据。跳过权限修复。"
         fi
@@ -175,14 +182,15 @@ sync_win_to_linux() {
     fi
 
     rm -f "$rsync_output_file" # 删除临时文件
-    rm -f "$LOCK_FILE"
+
+    release_lock   
 }
 
 # 清理函数
 cleanup() {
     log "🛑 接收到信号，停止所有进程..."
     pkill -P $$  # 终止所有子进程
-    rm -f "$LOCK_FILE"
+    release_lock   
     exit 0
 }
 
@@ -222,6 +230,7 @@ log "🔔 初始同步完成($SCRIPT_NAME PID:$$)。"
     
     while true; do
         sleep 5
+
         current_time=$(date +%s)
         
         # 如果最近有同步操作，跳过检测
@@ -235,13 +244,6 @@ log "🔔 初始同步完成($SCRIPT_NAME PID:$$)。"
                 \$items = Get-ChildItem -Recurse -Path '$WIN_DIR' -Exclude @('.git', '.svn', '.idea', '.vscode', 'node_modules', 'vendor', '*.log', '*.tmp', '.env', '*.swp', '~\$*') | \
                     Select-Object FullName, LastWriteTime, Length, @{Name='IsDirectory';Expression={\$_.PSIsContainer}}; \
                 \$items | ConvertTo-Json\"" || continue)
-        
-        # 检查SSH命令是否成功
-        if [ $? -ne 0 ]; then
-            log "⚠️ Windows 监控: SSH命令执行失败，等待重试..."
-            sleep 10
-            continue
-        fi
         
         # 如果为空，跳过
         if [ -z "$current_state" ]; then
