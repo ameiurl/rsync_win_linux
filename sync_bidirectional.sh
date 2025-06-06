@@ -156,12 +156,23 @@ sync_win_to_linux() {
           "$SSH_USER@$SSH_HOST:$WIN_CYGDRIVE_PATH/" \
           "$LINUX_DIR/" > "$rsync_output_file"
 
+    if [ -s "$rsync_output_file" ]; then # 检查文件是否非空
+        log "💡 DEBUG: Rsync itemized output from W→L in '$rsync_output_file':"
+        # 使用 cat 读取文件，并通过 sed 添加前缀，然后 tee 到主日志
+        # 这样做可以避免 rsync_output_file 中的特殊字符影响 echo 或 printf
+        sed 's/^/    DEBUG W→L: /' "$rsync_output_file" | tee -a "$LOG_FILE"
+    else
+        log "💡 DEBUG: Rsync output file '$rsync_output_file' is empty or does not exist."
+    fi
+
     local exit_code=${PIPESTATUS[0]}
     if [ $exit_code -eq 0 ]; then
         log "✅ 同步成功: Windows → Linux"
         
         # 这里的 if grep 条件是关键
-        if grep -E --line-regexp '^(>|c)[fd]' "$rsync_output_file"; then
+        # if grep -q -E '^(>|c)[fd]' "$rsync_output_file"; then
+        if grep -q -E '^>[fd]\+{9,}' "$rsync_output_file" || \
+           grep -q -E '^c[fd]\+{9,}' "$rsync_output_file"; then # {9,} 表示至少9个+
 
             log "🔩 检测到新文件或目录创建，应用 Linux 权限。"
             fix_linux_permissions "$LINUX_DIR"
