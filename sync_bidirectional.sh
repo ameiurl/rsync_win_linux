@@ -117,7 +117,7 @@ sync_linux_to_win() {
     log "🔄 开始同步: Linux → Windows"
     
     # shellcheck disable=SC2068
-    rsync -avz --no-owner --no-group --chmod=ugo=rwX \
+    rsync -avz --no-owner --no-group \
           -e "ssh -p $SSH_PORT" \
           --rsync-path="$WIN_RSYNC_PATH" \
           --delete \
@@ -148,32 +148,25 @@ sync_win_to_linux() {
     rsync_output_file=$(mktemp /tmp/rsync_win_out.XXXXXX) # 创建临时文件捕获rsync输出
     
     # shellcheck disable=SC2068
-    rsync -avz --no-owner --no-group \
+    rsync -avzi --no-owner --no-group \
           -e "ssh -p $SSH_PORT" \
           --rsync-path="$WIN_RSYNC_PATH" \
           --delete \
           ${RSYNC_EXCLUDES[@]} \
           "$SSH_USER@$SSH_HOST:$WIN_CYGDRIVE_PATH/" \
-          "$LINUX_DIR/" > "$rsync_output_file" | tee -a "$LOG_FILE"
+          "$LINUX_DIR/" > "$rsync_output_file"
 
     local exit_code=${PIPESTATUS[0]}
     if [ $exit_code -eq 0 ]; then
         log "✅ 同步成功: Windows → Linux"
         
-        if grep -q -v -e '^sending incremental file list' -e '^sent .* bytes  received .* bytes' -e '^total size is .* speedup is' "$rsync_output_file"; then
-            local current_time
-            current_time=$(date +%s)
-            local elapsed=$((current_time - LAST_PERMISSION_RESET))
-            
-            # 限制权限修复频率（至少1分钟一次）
-            if [[ $elapsed -gt 60 ]]; then
-                fix_linux_permissions "$LINUX_DIR"
-                LAST_PERMISSION_RESET=$current_time
-            else
-                log "⏳ 跳过权限修复（上次修复 ${elapsed} 秒前）"
-            fi
+        # 这里的 if grep 条件是关键
+        if grep -E --line-regexp '^(>|c)[fd]' "$rsync_output_file"; then
+
+            log "🔩 检测到新文件或目录创建，应用 Linux 权限。"
+            fix_linux_permissions "$LINUX_DIR"
         else
-            log "🔩 未检测到从 Windows 实际传输文件数据。跳过权限修复。"
+            log "🔩 未检测到新文件或目录创建 (基于 itemized output)，跳过权限修复。"
         fi
     elif [ $exit_code -eq 23 ]; then
         log "⚠️  部分文件同步失败 (代码 23): Windows → Linux"
