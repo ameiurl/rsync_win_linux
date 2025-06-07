@@ -123,11 +123,9 @@ sync_linux_to_win() {
           --delete \
           ${RSYNC_EXCLUDES[@]} \
           "$LINUX_DIR/" \
-          "$SSH_USER@$SSH_HOST:$WIN_CYGDRIVE_PATH/" > "$rsync_output_file" 2>&1
+          "$SSH_USER@$SSH_HOST:$WIN_CYGDRIVE_PATH/" 2>&1 | tee -a "$LOG_FILE"
 
-    local exit_code=$?
-    cat "$rsync_output_file" | tee -a "$LOG_FILE" >/dev/null
-
+    local exit_code=${PIPESTATUS[0]}
     if [ $exit_code -eq 0 ]; then
         log "✅ 同步成功: Linux → Windows"
     elif [ $exit_code -eq 23 ]; then
@@ -156,11 +154,9 @@ sync_win_to_linux() {
           --delete \
           ${RSYNC_EXCLUDES[@]} \
           "$SSH_USER@$SSH_HOST:$WIN_CYGDRIVE_PATH/" \
-          "$LINUX_DIR/" > "$rsync_output_file" 2>&1
+          "$LINUX_DIR/" > "$rsync_output_file" 2>&1 | tee -a "$LOG_FILE"
 
-    local exit_code=$?
-    cat "$rsync_output_file" | tee -a "$LOG_FILE" >/dev/null
-
+    local exit_code=${PIPESTATUS[0]}
     if [ $exit_code -eq 0 ]; then
         log "✅ 同步成功: Windows → Linux"
         
