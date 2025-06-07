@@ -123,9 +123,11 @@ sync_linux_to_win() {
           --delete \
           ${RSYNC_EXCLUDES[@]} \
           "$LINUX_DIR/" \
-          "$SSH_USER@$SSH_HOST:$WIN_CYGDRIVE_PATH/" 2>&1 | tee -a "$LOG_FILE"
-    
-    local exit_code=${PIPESTATUS[0]}
+          "$SSH_USER@$SSH_HOST:$WIN_CYGDRIVE_PATH/" > "$rsync_output_file" 2>&1
+
+    local exit_code=$?
+    cat "$rsync_output_file" | tee -a "$LOG_FILE" >/dev/null
+
     if [ $exit_code -eq 0 ]; then
         log "✅ 同步成功: Linux → Windows"
     elif [ $exit_code -eq 23 ]; then
@@ -138,7 +140,7 @@ sync_linux_to_win() {
 }
 
 sync_win_to_linux() {
-    if ! acquire_lock "Linux → Windows"; then
+    if ! acquire_lock "Windows → Linux"; then
         return
     fi
     
@@ -154,18 +156,11 @@ sync_win_to_linux() {
           --delete \
           ${RSYNC_EXCLUDES[@]} \
           "$SSH_USER@$SSH_HOST:$WIN_CYGDRIVE_PATH/" \
-          "$LINUX_DIR/" > "$rsync_output_file"
+          "$LINUX_DIR/" > "$rsync_output_file" 2>&1
 
-    # if [ -s "$rsync_output_file" ]; then # 检查文件是否非空
-    #     log "💡 DEBUG: Rsync itemized output from W→L in '$rsync_output_file':"
-    #     # 使用 cat 读取文件，并通过 sed 添加前缀，然后 tee 到主日志
-    #     # 这样做可以避免 rsync_output_file 中的特殊字符影响 echo 或 printf
-    #     sed 's/^/    DEBUG W→L: /' "$rsync_output_file" | tee -a "$LOG_FILE"
-    # else
-    #     log "💡 DEBUG: Rsync output file '$rsync_output_file' is empty or does not exist."
-    # fi
+    local exit_code=$?
+    cat "$rsync_output_file" | tee -a "$LOG_FILE" >/dev/null
 
-    local exit_code=${PIPESTATUS[0]}
     if [ $exit_code -eq 0 ]; then
         log "✅ 同步成功: Windows → Linux"
         
