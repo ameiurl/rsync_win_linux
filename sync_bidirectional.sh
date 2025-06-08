@@ -23,6 +23,7 @@ touch "$LOG_FILE"
 
 # 初始化去抖计时器
 LAST_LINUX_EVENT=0
+LAST_WIN_EVENT=0
 LAST_PERMISSION_RESET=0
 
 log() {
@@ -138,6 +139,17 @@ sync_linux_to_win() {
 }
 
 sync_win_to_linux() {
+    local current_time
+    current_time=$(date +%s)
+    local elapsed=$((current_time - LAST_WIN_EVENT))
+
+    # 去抖机制：1秒内的事件合并处理
+    if [[ $elapsed -lt 1 && $LAST_LINUX_EVENT -ne 0 ]]; then
+        log "⏱️ 合并连续事件（${elapsed}秒内）"
+        return
+    fi
+    LAST_WIN_EVENT=$current_time
+
     if ! acquire_lock "Windows → Linux"; then
         return
     fi
@@ -258,6 +270,23 @@ log "🔔 初始同步完成($SCRIPT_NAME PID:$$)。"
             sync_win_to_linux
             previous_state="$current_state"
         fi
+    done
+) &
+
+# 日志轮转
+rotate_log() {
+    if [ -f "$LOG_FILE" ] && [ $(stat -f%z "$LOG_FILE" 2>/dev/null || stat -c%s "$LOG_FILE") -gt 10485760 ]; then  # 10MB
+        mv "$LOG_FILE" "${LOG_FILE}.old"
+        touch "$LOG_FILE"
+        log "📋 日志文件已轮转"
+    fi
+}
+
+# 定期清理
+(
+    while true; do
+        sleep 3600  # 每小时检查一次
+        rotate_log
     done
 ) &
 
