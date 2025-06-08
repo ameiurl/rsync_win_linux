@@ -91,8 +91,8 @@ fix_linux_permissions() {
     # 设置默认 ACL: 在 $target_dir 中新创建的文件/目录将继承这些权限。
     if command -v setfacl >/dev/null; then # 检查 setfacl 命令是否存在
         $SUDO_CMD setfacl -R -b "$target_dir" 2>/dev/null # 清理已存在的 ACL
-        $SUDO_CMD setfacl -R -d -m "u:$NORMAL_USER:rwx,g:$NORMAL_GROUP:rx,o::rx" "$target_dir" # 设置默认ACL
-        $SUDO_CMD setfacl -R -m "u:$NORMAL_USER:rwx,g:$NORMAL_GROUP:rx,o::rx" "$target_dir" # 应用到现有文件
+        # $SUDO_CMD setfacl -R -d -m "u:$NORMAL_USER:rwx,g:$NORMAL_GROUP:rx,o::rx" "$target_dir" # 设置默认ACL
+        # $SUDO_CMD setfacl -R -m "u:$NORMAL_USER:rwx,g:$NORMAL_GROUP:rx,o::rx" "$target_dir" # 应用到现有文件
         log "🔩 Linux 权限 (包括 ACL - 如果可用) 已为 '$target_dir' 应用"
     else
         log "🔩 Linux 权限 (基本 chmod) 已为 '$target_dir' 应用。未找到 setfacl 命令。"
