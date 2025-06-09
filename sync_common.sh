@@ -158,13 +158,15 @@ sync_win_to_linux() {
             # 在这里添加更多你需要忽略的完整路径
         )
 
+        # --- 构建 find 命令的排除参数 ---
         local find_prune_args=()
         if [ ${#ignored_paths[@]} -gt 0 ]; then
-            find_prune_args+=(-path "${ignored_paths[0]}")
+            # ( -path a -o -path b ) -prune -o
+            local prune_conditions=(-path "${ignored_paths[0]}")
             for ((i=1; i<${#ignored_paths[@]}; i++)); do
-                find_prune_args+=(-o -path "${ignored_paths[i]}")
+                prune_conditions+=(-o -path "${ignored_paths[i]}")
             done
-            find_prune_args+=(-prune -o)
+            find_prune_args=( \( "${prune_conditions[@]}" \) -prune -o )
         fi
         
         # 权限修复逻辑保持不变
