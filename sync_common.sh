@@ -28,25 +28,43 @@ release_lock() {
     log "LOCK" "锁已释放"
 }
 
+# --- 权限处理函数 (带忽略功能) ---
 fix_linux_permissions() {
     local target_dir="$1"
-    log "PERMS" "🔧 正在为 '$target_dir' 应用标准权限 (User: $NORMAL_USER)"
+    shift # 移除第一个参数，剩下的都是要忽略的路径
+    local ignored_paths=("$@")
 
-    # 使用 sudo (如果需要且可用)
-    local SUDO_CMD=""
-    if [ "$(id -u)" -ne 0 ]; then
-        if command -v sudo >/dev/null; then
-            SUDO_CMD="sudo"
-        else
-            log "PERMS" "⚠️ 警告: 非 root 用户且无 sudo 命令，权限修复可能不完整。"
-        fi
+    log "🔧 正在为 Linux 目录 '$target_dir' 应用权限 (用户: $NORMAL_USER, 用户组: $NORMAL_GROUP)"
+    if [ ${#ignored_paths[@]} -gt 0 ]; then
+        log "    - 忽略以下路径: ${ignored_paths[*]}"
     fi
 
-    # 批量修复，更高效
-    $SUDO_CMD chown -R "$NORMAL_USER:$NORMAL_GROUP" "$target_dir"
-    $SUDO_CMD find "$target_dir" -type d -exec chmod 755 {} +
-    $SUDO_CMD find "$target_dir" -type f -exec chmod 644 {} +
-    log "PERMS" "🔩 基本权限 (chown/chmod) 已应用。"
+    # --- 构建 find 命令的排除参数 ---
+    local find_prune_args=()
+    if [ ${#ignored_paths[@]} -gt 0 ]; then
+        # -path a -o -path b -o -path c
+        find_prune_args+=(-path "${ignored_paths[0]}")
+        for ((i=1; i<${#ignored_paths[@]}; i++)); do
+            find_prune_args+=(-o -path "${ignored_paths[i]}")
+        done
+        # 完整的排除逻辑: ( -path a -o -path b ) -prune -o <其他操作>
+        find_prune_args=( \( "${find_prune_args[@]}" \) -prune -o )
+    fi
+    
+    local SUDO_CMD=""
+    if [ "$(id -u)" -ne 0 ]; then SUDO_CMD="sudo"; fi
+
+    # --- 执行带排除功能的 chown 和 chmod ---
+    # shellcheck disable=SC2211
+    find "$target_dir" "${find_prune_args[@]}" -exec $SUDO_CMD chown "$NORMAL_USER:$NORMAL_GROUP" {} +
+    
+    # shellcheck disable=SC2211
+    find "$target_dir" "${find_prune_args[@]}" -type d -exec $SUDO_CMD chmod 755 {} +
+    
+    # shellcheck disable=SC2211
+    find "$target_dir" "${find_prune_args[@]}" -type f -exec $SUDO_CMD chmod 644 {} +
+
+    log "🔩 Linux 权限已应用"
 }
 
 sync_linux_to_win() {
@@ -125,15 +143,37 @@ sync_win_to_linux() {
         log "SYNC_DETAIL" "--- 结束输出 ---"
     fi
     
-    rm -f "$rsync_output_file" # 清理临时文件
-
     if [ $exit_code -eq 0 ]; then
         log "SYNC" "✅ 同步成功: Windows → Linux"
+
+        # 定义要忽略权限检查的目录路径 (相对于 $LINUX_DIR)
+        # 注意：这里的路径是 find 命令能理解的路径
+        local ignored_paths=(
+            "$LINUX_DIR/.git"
+            "$LINUX_DIR/node_modules"
+            "$LINUX_DIR/vendor"
+            "$LINUX_DIR/storage/logs"  # 示例：Laravel 的日志目录
+            "$LINUX_DIR/bootstrap/cache" # 示例：Laravel 的缓存目录
+            "$LINUX_DIR/runtime"
+            # 在这里添加更多你需要忽略的完整路径
+        )
+
+        local find_prune_args=()
+        if [ ${#ignored_paths[@]} -gt 0 ]; then
+            find_prune_args+=(-path "${ignored_paths[0]}")
+            for ((i=1; i<${#ignored_paths[@]}; i++)); do
+                find_prune_args+=(-o -path "${ignored_paths[i]}")
+            done
+            find_prune_args+=(-prune -o)
+        fi
         
         # 权限修复逻辑保持不变
-        if [ -n "$(find "$LINUX_DIR" -not \( -user "$NORMAL_USER" -and -group "$NORMAL_GROUP" \) -print -quit)" ]; then
+        # 使用 find 命令检查是否有文件的所有者或组不匹配
+        # 新增了 -prune 参数来忽略指定目录
+        # shellcheck disable=SC2211
+        if [ -n "$(find "$LINUX_DIR" "${find_prune_args[@]}" -not \( -user "$NORMAL_USER" -and -group "$NORMAL_GROUP" \) -print -quit)" ]; then
             log "PERMS" "🔩 检测到权限不匹配，开始修复..."
-            fix_linux_permissions "$LINUX_DIR"
+            fix_linux_permissions "$LINUX_DIR" "${ignored_paths[@]}"
         else
             log "PERMS" "🔩 权限检查通过，无需修复。"
         fi
@@ -142,6 +182,8 @@ sync_win_to_linux() {
     else
         log "SYNC" "❌ 同步失败 [代码 $exit_code]: Windows → Linux"
     fi
+
+    rm -f "$rsync_output_file" # 清理临时文件
 
     release_lock
 }
