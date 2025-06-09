@@ -1,295 +1,283 @@
-log() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
-}
-
-# 定义排除列表 (rsync格式)
-RSYNC_EXCLUDES=(
-    "--exclude=.git/"
-    "--exclude=.svn/"
-    "--exclude=.idea/"
-    "--exclude=.vscode/"
-    "--exclude=node_modules/"
-    "--exclude=vendor/"
-    "--exclude=.env"
-    "--exclude=*.log"
-    "--exclude=*.tmp"
-    "--exclude=*.swp"
-    "--exclude=~$*"
-)
-
-# 定义排除列表 (inotifywait ERE regex格式)
-INOTIFY_EXCLUDE_PATTERN='(\.git/|\.svn/|\.idea/|\.vscode/|node_modules/|vendor/|\.env$|\.log$|\.tmp$|\.swp$|^~\$.*)'
-
-# 改进后的锁机制
+# 改进的原子锁机制
 acquire_lock() {
-    local waited=0
-    while [ -f "$LOCK_FILE" ] && [ $waited -lt $MAX_WAIT ]; do
-        sleep 1
-        waited=$((waited + 1))
-    done
-    if [ $waited -ge $MAX_WAIT ]; then
-        log "⛔ 等待锁定超时，放弃同步: $1"
-        return 1
+    local lock_purpose="$1"
+    # 使用 noclobber 选项实现原子性操作，防止竞争条件
+    if (set -o noclobber; echo "$$" > "$LOCK_FILE") 2> /dev/null; then
+        log "LOCK" "成功获取锁: $lock_purpose"
+        return 0
+    else
+        local holder_pid
+        holder_pid=$(cat "$LOCK_FILE")
+        log "LOCK" "等待锁... (当前持有者 PID: $holder_pid, 目的: $lock_purpose)"
+        # 等待，而不是超时放弃。让同步排队执行。
+        while ! (set -o noclobber; echo "$$" > "$LOCK_FILE") 2> /dev/null; do
+            # 检查持有锁的进程是否还存在，防止死锁
+            if ! ps -p "$holder_pid" > /dev/null; then
+                log "LOCK" "检测到死锁 (PID $holder_pid 不存在)，强制释放。"
+                rm -f "$LOCK_FILE"
+            fi
+            sleep 1
+        done
+        log "LOCK" "先前任务完成，已获取锁: $lock_purpose"
+        return 0
     fi
-    touch "$LOCK_FILE"
-    return 0
 }
 
 release_lock() {
     rm -f "$LOCK_FILE"
+    log "LOCK" "锁已释放"
 }
 
-# --- 权限处理函数 (Linux - 简化版，但使用默认 ACL) ---
 fix_linux_permissions() {
     local target_dir="$1"
-    log "🔧 正在为 Linux 目录 '$target_dir' 应用权限 (用户: $NORMAL_USER, 用户组: $NORMAL_GROUP)"
+    log "PERMS" "🔧 正在为 '$target_dir' 应用标准权限 (User: $NORMAL_USER)"
 
+    # 使用 sudo (如果需要且可用)
     local SUDO_CMD=""
-    if [ "$(id -u)" -ne 0 ] && ! (sudo -n true 2>/dev/null); then # 检查是否非 root 且无法免密 sudo
-      log "⚠️ 警告: 当前非 root 用户，且 sudo -n 不可用。权限可能无法完全应用。"
-    elif [ "$(id -u)" -ne 0 ]; then # 如果非 root 但 sudo -n 可用（或需要密码）
-      SUDO_CMD="sudo"
+    if [ "$(id -u)" -ne 0 ]; then
+        if command -v sudo >/dev/null; then
+            SUDO_CMD="sudo"
+        else
+            log "PERMS" "⚠️ 警告: 非 root 用户且无 sudo 命令，权限修复可能不完整。"
+        fi
     fi
 
+    # 批量修复，更高效
     $SUDO_CMD chown -R "$NORMAL_USER:$NORMAL_GROUP" "$target_dir"
-    # 标准权限: 目录 User=rwx, Group=rx, Other=rx
-    #           文件 User=rw, Group=r, Other=r
-    find "$target_dir" -type d -exec $SUDO_CMD chmod 755 {} \;
-    find "$target_dir" -type f -exec $SUDO_CMD chmod 644 {} \;
-    # 使常见脚本类型对所有者可执行 (如果 755 已设置，则组和其他用户也可执行)
-    find "$target_dir" \( -name "*.sh" -o -name "*.py" -o -name "*.pl" -o -name "*.cgi" \) -perm /u+x -exec $SUDO_CMD chmod u+x {} \;
-
-
-    # 设置默认 ACL: 在 $target_dir 中新创建的文件/目录将继承这些权限。
-    if command -v setfacl >/dev/null; then # 检查 setfacl 命令是否存在
-        $SUDO_CMD setfacl -R -b "$target_dir" 2>/dev/null # 清理已存在的 ACL
-        # $SUDO_CMD setfacl -R -d -m "u:$NORMAL_USER:rwx,g:$NORMAL_GROUP:rx,o::rx" "$target_dir" # 设置默认ACL
-        # $SUDO_CMD setfacl -R -m "u:$NORMAL_USER:rwx,g:$NORMAL_GROUP:rx,o::rx" "$target_dir" # 应用到现有文件
-        log "🔩 Linux 权限 (包括 ACL - 如果可用) 已为 '$target_dir' 应用"
-    else
-        log "🔩 Linux 权限 (基本 chmod) 已为 '$target_dir' 应用。未找到 setfacl 命令。"
-    fi
+    $SUDO_CMD find "$target_dir" -type d -exec chmod 755 {} +
+    $SUDO_CMD find "$target_dir" -type f -exec chmod 644 {} +
+    log "PERMS" "🔩 基本权限 (chown/chmod) 已应用。"
 }
 
 sync_linux_to_win() {
-    local current_time
-    current_time=$(date +%s)
-    local elapsed=$((current_time - LAST_LINUX_EVENT))
-
-    # 去抖机制：1秒内的事件合并处理
-    if [[ $elapsed -lt 1 && $LAST_LINUX_EVENT -ne 0 ]]; then
-        log "⏱️ 合并连续事件（${elapsed}秒内）"
-        return
-    fi
-    LAST_LINUX_EVENT=$current_time
-
-    if ! acquire_lock "Linux → Windows"; then
-        return
-    fi
+    if ! acquire_lock "Linux → Windows"; then return; fi
     
-    log "🔄 开始同步: Linux → Windows"
+    log "SYNC" "🔄 开始同步: Linux → Windows"
     
+    # 临时文件用于捕获 rsync 的详细输出
+    local rsync_output_file
+    rsync_output_file=$(mktemp /tmp/rsync_linux_out.XXXXXX)
+
+    # ★★★ 关键修改 ★★★
+    # 1. 添加 -i (--itemize-changes) 参数用于详细诊断
+    # 2. 将标准输出和错误都重定向到临时文件
     # shellcheck disable=SC2068
-    rsync -avz --no-owner --no-group \
+    rsync -avzi --no-owner --no-group --delete \
           -e "ssh -p $SSH_PORT" \
           --rsync-path="$WIN_RSYNC_PATH" \
-          --delete \
-          ${RSYNC_EXCLUDES[@]} \
+          "${RSYNC_EXCLUDES[@]}" \
           "$LINUX_DIR/" \
-          "$SSH_USER@$SSH_HOST:$WIN_CYGDRIVE_PATH/" 2>&1 | tee -a "$LOG_FILE"
+          "$SSH_USER@$SSH_HOST:$WIN_CYGDRIVE_PATH/" > "$rsync_output_file" 2>&1
 
-    local exit_code=${PIPESTATUS[0]}
+    # 3. 使用 $? 而不是 ${PIPESTATUS[0]}
+    local exit_code=$?
+    
+    # 将 rsync 的详细输出打印到主日志文件
+    if [ -s "$rsync_output_file" ]; then
+        log "SYNC_DETAIL" "--- rsync 输出 ---"
+        # 使用 sed 添加缩进，方便阅读
+        sed 's/^/    /g' "$rsync_output_file" | tee -a "$LOG_FILE"
+        log "SYNC_DETAIL" "--- 结束输出 ---"
+    fi
+    
+    rm -f "$rsync_output_file" # 清理临时文件
+
     if [ $exit_code -eq 0 ]; then
-        log "✅ 同步成功: Linux → Windows"
-    elif [ $exit_code -eq 23 ]; then
-        log "⚠️  部分文件同步失败 (代码 23): Linux → Windows"
+        log "SYNC" "✅ 同步成功: Linux → Windows"
+    elif [ $exit_code -eq 23 ]; then # 部分文件传输错误
+        log "SYNC" "⚠️ 部分文件同步失败 (代码 23): Linux → Windows"
     else
-        log "❌ 同步失败 [代码 $exit_code]: Linux → Windows"
+        log "SYNC" "❌ 同步失败 [代码 $exit_code]: Linux → Windows"
     fi
  
-    release_lock   
+    release_lock
 }
 
+
 sync_win_to_linux() {
-    local current_time
-    current_time=$(date +%s)
-    local elapsed=$((current_time - LAST_WIN_EVENT))
-
-    # 去抖机制：1秒内的事件合并处理
-    if [[ $elapsed -lt 1 && $LAST_LINUX_EVENT -ne 0 ]]; then
-        log "⏱️ 合并连续事件（${elapsed}秒内）"
-        return
-    fi
-    LAST_WIN_EVENT=$current_time
-
-    if ! acquire_lock "Windows → Linux"; then
-        return
-    fi
+    if ! acquire_lock "Windows → Linux"; then return; fi
     
-    log "🔄 开始同步: Windows → Linux"
-
+    log "SYNC" "🔄 开始同步: Windows → Linux"
+    
+    # 临时文件用于捕获 rsync 的详细输出
     local rsync_output_file
-    rsync_output_file=$(mktemp /tmp/rsync_win_out.XXXXXX) # 创建临时文件捕获rsync输出
-    
+    rsync_output_file=$(mktemp /tmp/rsync_win_out.XXXXXX)
+
+    # ★★★ 关键修改 ★★★
+    # 1. 添加 -i (--itemize-changes) 参数用于详细诊断
+    # 2. 将标准输出和错误都重定向到临时文件
     # shellcheck disable=SC2068
-    rsync -avzi --no-owner --no-group \
+    rsync -avzi --no-owner --no-group --delete \
           -e "ssh -p $SSH_PORT" \
           --rsync-path="$WIN_RSYNC_PATH" \
-          --delete \
-          ${RSYNC_EXCLUDES[@]} \
+          "${RSYNC_EXCLUDES[@]}" \
           "$SSH_USER@$SSH_HOST:$WIN_CYGDRIVE_PATH/" \
           "$LINUX_DIR/" > "$rsync_output_file" 2>&1
 
-    # 在这里，我们将 tee 的调用移到 rsync 命令之后，以便我们可以先捕获纯净的输出
-    cat "$rsync_output_file" | tee -a "$LOG_FILE"
+    # 3. 使用 $? 而不是 ${PIPESTATUS[0]}
+    local exit_code=$?
+    
+    # 将 rsync 的详细输出打印到主日志文件
+    if [ -s "$rsync_output_file" ]; then
+        log "SYNC_DETAIL" "--- rsync 输出 (Win→Lin) ---"
+        # 使用 sed 添加缩进，方便阅读
+        sed 's/^/    /g' "$rsync_output_file" | tee -a "$LOG_FILE"
+        log "SYNC_DETAIL" "--- 结束输出 ---"
+    fi
+    
+    rm -f "$rsync_output_file" # 清理临时文件
 
-    local exit_code=${PIPESTATUS[0]}
     if [ $exit_code -eq 0 ]; then
-        log "✅ 同步成功: Windows → Linux"
-
-        # --- 权限检查逻辑 (关键修改点) ---
-        local needs_permission_fix=false
-
-        # 条件 1: 检测到 rsync 创建了新文件或目录 (沿用旧逻辑)
-        if grep -q -E '^(>|c)[fd]\+{9,}' "$rsync_output_file"; then
-            log "🔩 检测到 rsync 创建了新文件/目录。"
-            needs_permission_fix=true
-        fi
-
-        # 条件 2: 检测到 Linux 目录中存在权限不正确的文件/目录 (新增的核心逻辑)
-        # 使用 find 命令检查是否有文件的所有者或组不匹配 $NORMAL_USER/$NORMAL_GROUP
-        # '-print -quit' 是一个优化，找到第一个不匹配项后就立即退出，非常高效。
-        if [ "$needs_permission_fix" = false ] && \
-           [ -n "$(find "$LINUX_DIR" -not \( -user "$NORMAL_USER" -and -group "$NORMAL_GROUP" \) -print -quit)" ]; then
-            log "🔩 检测到 Linux 目录中存在权限不正确的文件/目录 (所有者/组不匹配)。"
-            needs_permission_fix=true
-        fi
-
-        # 如果满足任一条件，则执行权限修复
-        if [ "$needs_permission_fix" = true ]; then
-            log "🔧 基于以上检测，开始修复 Linux 权限..."
+        log "SYNC" "✅ 同步成功: Windows → Linux"
+        
+        # 权限修复逻辑保持不变
+        if [ -n "$(find "$LINUX_DIR" -not \( -user "$NORMAL_USER" -and -group "$NORMAL_GROUP" \) -print -quit)" ]; then
+            log "PERMS" "🔩 检测到权限不匹配，开始修复..."
             fix_linux_permissions "$LINUX_DIR"
         else
-            log "🔩 未检测到需要修复权限的情况，跳过。"
+            log "PERMS" "🔩 权限检查通过，无需修复。"
         fi
-        
-        # # 这里的 if grep 条件是关键
-        # # if grep -q -E '^(>|c)[fd]' "$rsync_output_file"; then
-        # if grep -q -E '^>[fd]\+{9,}' "$rsync_output_file" || \
-        #    grep -q -E '^c[fd]\+{9,}' "$rsync_output_file"; then # {9,} 表示至少9个+
-        #
-        #     log "🔩 检测到新文件或目录创建，应用 Linux 权限。"
-        #     fix_linux_permissions "$LINUX_DIR"
-        # else
-        #     log "🔩 未检测到新文件或目录创建 (基于 itemized output)，跳过权限修复。"
-        # fi
     elif [ $exit_code -eq 23 ]; then
-        log "⚠️  部分文件同步失败 (代码 23): Windows → Linux"
+        log "SYNC" "⚠️ 部分文件同步失败 (代码 23): Windows → Linux"
     else
-        log "❌ 同步失败 [代码 $exit_code]: Windows → Linux"
+        log "SYNC" "❌ 同步失败 [代码 $exit_code]: Windows → Linux"
     fi
 
-    rm -f "$rsync_output_file" # 删除临时文件
-
-    release_lock   
+    release_lock
 }
 
-# 清理函数
-cleanup() {
-    log "🛑 接收到信号，停止所有进程..."
-    pkill -P $$  # 终止所有子进程
-    release_lock   
-    exit 0
-}
 
-# 设置信号捕获
-trap cleanup SIGINT SIGTERM
+# --- 监控与触发器 ---
 
-# 初始同步 - 修复死锁问题
-log "🚀 脚本 ($SCRIPT_NAME PID:$$) 已启动。正在执行初始同步..."
-
-# 先同步Linux到Windows
-sync_linux_to_win
-
-# 再同步Windows到Linux
-sync_win_to_linux
-
-log "🔔 初始同步完成($SCRIPT_NAME PID:$$)。"
-
-# Linux 端监控
-(
-    log "🔍 开始监控 Linux 目录: $LINUX_DIR"
-    inotifywait -m -r -e create,delete,modify,move \
-                --exclude "$INOTIFY_EXCLUDE_PATTERN" \
+# ★★★ 关键改进：Linux 监控与防抖触发器 ★★★
+monitor_linux_changes() {
+    log "INFO" "🔍 [L-MON] 开始监控 Linux 目录: $LINUX_DIR"
+    # 步骤1: 侦听事件并“举旗”
+    inotifywait -m -r -q -e create,delete,modify,move \
+                --excludei "$INOTIFY_EXCLUDE_PATTERN" \
                 "$LINUX_DIR" |
     while read -r path action file; do
-        log "📢 Linux 变化: $action $file (在路径 $path)"
-        sync_linux_to_win
+        # 任何事件都只做一件事：创建标志文件
+        touch "$LINUX_CHANGE_FLAG"
     done
-) &
-
-# Windows 端监控 (简化可靠的检测方法)
-(
-    log "🔍 开始监控 Windows 目录: $WIN_DIR"
-    
-    # 初始化状态
-    previous_state=""
-    last_sync_time=0
-    
-    while true; do
-        sleep 5
-
-        current_time=$(date +%s)
-        
-        # 如果最近有同步操作，跳过检测
-        if [ $((current_time - last_sync_time)) -lt 5 ]; then
-            continue
-        fi
-        
-        # 获取当前文件系统状态
-        current_state=$(ssh -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" \
-            "powershell -Command \"\
-                \$items = Get-ChildItem -Recurse -Path '$WIN_DIR' -Exclude @('.git', '.svn', '.idea', '.vscode', 'node_modules', 'vendor', '*.log', '*.tmp', '.env', '*.swp', '~\$*') | \
-                    Select-Object FullName, LastWriteTime, Length, @{Name='IsDirectory';Expression={\$_.PSIsContainer}}; \
-                \$items | ConvertTo-Json\"" || continue)
-        
-        # 如果为空，跳过
-        if [ -z "$current_state" ]; then
-            log "⚠️ Windows 监控: 当前状态为空，跳过检测"
-            continue
-        fi
-        
-        # 第一次运行，设置初始状态
-        if [ -z "$previous_state" ]; then
-            previous_state="$current_state"
-            continue
-        fi
-        
-        # 比较状态
-        if [ "$previous_state" != "$current_state" ]; then
-            log "📢 Windows 检测到变化"
-            sync_win_to_linux
-            previous_state="$current_state"
-        fi
-    done
-) &
-
-# 日志轮转
-rotate_log() {
-    if [ -f "$LOG_FILE" ] && [ $(stat -f%z "$LOG_FILE" 2>/dev/null || stat -c%s "$LOG_FILE") -gt 10485760 ]; then  # 10MB
-        mv "$LOG_FILE" "${LOG_FILE}.old"
-        touch "$LOG_FILE"
-        log "📋 日志文件已轮转"
-    fi
 }
 
-# 定期清理
-(
+# 防抖处理循环
+debounce_and_sync_linux() {
+    log "INFO" "🚀 [L-SYNC] 防抖同步服务已启动"
     while true; do
-        sleep 3600  # 每小时检查一次
-        rotate_log
-    done
-) &
+        # 等待标志文件出现
+        while [ ! -f "$LINUX_CHANGE_FLAG" ]; do
+            sleep 1
+        done
 
-# 等待所有后台进程
-wait
+        # 标志出现，开始防抖计时
+        log "EVENT" "📢 检测到 Linux 变化，启动 3 秒防抖计时器..."
+        rm -f "$LINUX_CHANGE_FLAG" # 消耗掉旧的标志
+        sleep 3 # 防抖窗口
+
+        # 如果在 3 秒内又有新变化（标志文件被再次创建），则循环到下一次，重新计时
+        if [ -f "$LINUX_CHANGE_FLAG" ]; then
+            log "EVENT" "⏱️ 防抖期间检测到新变化，重置计时器。"
+            continue
+        fi
+
+        # 计时结束且无新变化，执行同步
+        log "EVENT" "🟢 防抖计时结束，执行同步操作。"
+        sync_linux_to_win
+    done
+}
+
+
+monitor_windows_changes() {
+    log "INFO" "🔍 [W-MON] 开始轮询监控 Windows 目录: $WIN_DIR (间隔 10s)"
+    local previous_state=""
+    
+    while true; do
+        # 获取当前文件系统状态快照
+        # 增加了错误处理，如果ssh失败，则循环继续而不是退出
+        local current_state
+        current_state=$(ssh -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" \
+            "powershell -Command \"Get-ChildItem -Recurse -Path '$WIN_DIR' -Exclude @('.git', '.svn', '.idea', '.vscode', 'node_modules', 'vendor', 'runtime', '*.log', '*.tmp', '.env', '*.swp', '~\$*') | Select-Object FullName, LastWriteTime, Length | Sort-Object FullName | ConvertTo-Json -Compress\"" 2>/dev/null)
+        
+        # 如果命令失败或返回空，则跳过本次检查
+        if [ -z "$current_state" ]; then
+            log "WARN" "⚠️ [W-MON] 无法获取 Windows 目录状态 (网络或权限问题?)，15秒后重试。"
+            sleep 15
+            continue
+        fi
+        
+        # 首次运行时初始化状态
+        if [ -z "$previous_state" ]; then
+            previous_state="$current_state"
+            sleep 10 # 初始化的等待时间
+            continue
+        fi
+        
+        # 比较快照
+        if [ "$previous_state" != "$current_state" ]; then
+            log "EVENT" "📢 检测到 Windows 目录状态变化"
+            sync_win_to_linux
+            # 同步后立即更新状态，避免重复触发
+            previous_state=$(ssh -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" \
+            "powershell -Command \"Get-ChildItem -Recurse -Path '$WIN_DIR' -Exclude @('.git', '.svn', '.idea', '.vscode', 'node_modules', 'vendor', 'runtime', '*.log', '*.tmp', '.env', '*.swp', '~\$*') | Select-Object FullName, LastWriteTime, Length | Sort-Object FullName | ConvertTo-Json -Compress\"" 2>/dev/null)
+        fi
+
+        sleep 10 # 轮询间隔
+    done
+}
+
+# --- 脚本主程序 ---
+main() {
+    # 检查 PID 文件，防止脚本多重启动
+    if [ -f "$PID_FILE" ] && ps -p "$(cat "$PID_FILE")" > /dev/null; then
+        log "ERROR" "❌ 脚本已在运行 (PID: $(cat "$PID_FILE"))。请先停止旧实例。"
+        exit 1
+    fi
+    echo $$ > "$PID_FILE"
+
+    # 清理函数
+    cleanup() {
+        log "INFO" "🛑 接收到信号，正在清理并退出..."
+        rm -f "$PID_FILE" "$LOCK_FILE" "$LINUX_CHANGE_FLAG"
+        # 优雅地杀死所有后台子进程
+        if [ -n "$L_MON_PID" ]; then kill "$L_MON_PID"; fi
+        if [ -n "$L_SYNC_PID" ]; then kill "$L_SYNC_PID"; fi
+        if [ -n "$W_MON_PID" ]; then kill "$W_MON_PID"; fi
+        log "INFO" "👋 脚本已停止。"
+        exit 0
+    }
+    trap cleanup SIGINT SIGTERM
+
+    log "INFO" "🚀 脚本启动 (PID: $$)"
+    
+    # 初始全量同步 (先拉取，再推送，以远程为准或根据需求调整)
+    log "INIT" "执行初始同步..."
+    sync_win_to_linux
+    sync_linux_to_win
+    log "INIT" "✅ 初始同步完成。"
+
+    # 启动后台监控进程
+    monitor_linux_changes &
+    L_MON_PID=$!
+    
+    debounce_and_sync_linux &
+    L_SYNC_PID=$!
+
+    monitor_windows_changes &
+    W_MON_PID=$!
+
+    log "INFO" "✅ 所有监控进程已启动。"
+    log "INFO" "Linux Watcher PID: $L_MON_PID"
+    log "INFO" "Linux Syncer PID: $L_SYNC_PID"
+    log "INFO" "Windows Watcher PID: $W_MON_PID"
+    log "INFO" "日志文件位于: $LOG_FILE"
+    log "INFO" "脚本正在后台运行，按 Ctrl+C 停止。"
+
+    # 等待所有后台任务结束（实际上是无限等待，直到被 trap 捕获）
+    wait
+}
+
+# 执行主函数
+main "$@"
+
