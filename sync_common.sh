@@ -206,32 +206,34 @@ monitor_linux_changes() {
     done
 }
 
-# 防抖处理循环
+# ★★★ 关键修正：更健壮的“后沿触发”防抖逻辑 ★★★
 debounce_and_sync_linux() {
-    log "INFO" "🚀 [L-SYNC] 防抖同步服务已启动"
+    log "INFO" "🚀 [L-SYNC] 防抖同步服务已启动 (后沿触发模式)"
     while true; do
-        # 等待标志文件出现
+        # 1. 等待，直到第一个变化发生（标志文件出现）
         while [ ! -f "$LINUX_CHANGE_FLAG" ]; do
-            sleep 1
+            sleep 0.5 # 短暂休眠，降低 CPU 占用
         done
 
-        # 标志出现，开始防抖计时
-        log "EVENT" "📢 检测到 Linux 变化，启动 3 秒防抖计时器..."
-        rm -f "$LINUX_CHANGE_FLAG" # 消耗掉旧的标志
-        sleep 3 # 防抖窗口
+        # 2. 第一个变化已捕获。现在我们等待系统“安静下来”。
+        #    只要在我们的“安静期”（例如 2 秒）内仍有变化，就继续循环。
+        log "EVENT" "📢 检测到 Linux 变化，进入 2 秒稳定期..."
+        
+        while [ -f "$LINUX_CHANGE_FLAG" ]; do
+            # 将检测到的标志消耗掉
+            rm -f "$LINUX_CHANGE_FLAG"
+            # 等待一小段“安静”时间
+            sleep 2
+            # 循环会再次检查在这 2 秒内，`monitor_linux_changes` 是否又创建了新的标志文件。
+            # 如果创建了，说明变化仍在继续，循环将继续。
+        done
 
-        # 如果在 3 秒内又有新变化（标志文件被再次创建），则循环到下一次，重新计时
-        if [ -f "$LINUX_CHANGE_FLAG" ]; then
-            log "EVENT" "⏱️ 防抖期间检测到新变化，重置计时器。"
-            continue
-        fi
-
-        # 计时结束且无新变化，执行同步
-        log "EVENT" "🟢 防抖计时结束，执行同步操作。"
+        # 3. 如果能跳出上面的 while 循环，说明我们刚刚经历了完整的 2 秒“安静期”，
+        #    文件系统已经稳定。现在是执行同步的最佳时机。
+        log "EVENT" "🟢 文件系统已稳定，执行同步操作。"
         sync_linux_to_win
     done
 }
-
 
 monitor_windows_changes() {
     log "INFO" "🔍 [W-MON] 开始轮询监控 Windows 目录: $WIN_DIR (间隔 10s)"
