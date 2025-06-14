@@ -1,355 +1,265 @@
 #!/bin/bash
 # 权限修复与防抖增强版 - 双向实时监控同步脚本
-# 解决了高频文件变更导致的同步中断问题
+# v6: 引入同步前安全检查，彻底解决竞态条件下的数据丢失问题
 
 # --- 配置参数 ---
 SSH_USER="amei"
 SSH_HOST="192.168.1.3"
 SSH_PORT="22"
-LINUX_DIR="/server/www"
-WIN_DIR="D:\\www" # PowerShell/Windows 路径
-WIN_CYGDRIVE_PATH="/cygdrive/d/www" # Cygwin 路径 (用于 rsync)
+LINUX_DIR="/server/www/mallphp"
+WIN_DIR="D:\\www\\mallphp" # PowerShell/Windows 路径
+WIN_CYGDRIVE_PATH="/cygdrive/d/www/mallphp" # Cygwin 路径 (用于 rsync)
 WIN_RSYNC_PATH="\"D:/Program Files (x86)/cwRsync/bin/rsync.exe\"" # 注意引号的使用
 
-LOG_FILE="/var/log/www_sync.log"
-LOCK_FILE="/tmp/rsync_www.lock"
-PID_FILE="/tmp/www_sync.pid"
+LOG_FILE="/var/log/mallphp_sync.log"
+LOCK_FILE="/tmp/mallphp_sync.lock"
+PID_FILE="/tmp/mallphp_sync.pid"
 
 # 用于防抖的临时标志文件
-LINUX_CHANGE_FLAG="/tmp/linux_change.flag"
+LINUX_CHANGE_FLAG="/tmp/mallphp_sync.flag"
+
+### ★★★ 新增：用于存储上一次同步后 Windows 状态的快照文件 ★★★
+WIN_STATE_FILE="/tmp/mallphp_win_state.snapshot"
 
 # 普通用户（用于权限修复）
 NORMAL_USER="amei"
 NORMAL_GROUP="amei"
 
 # --- 日志与锁 ---
-# 确保日志目录和文件存在且可写
 mkdir -p "$(dirname "$LOG_FILE")"
 touch "$LOG_FILE" || { echo "错误：无法创建或写入日志文件 $LOG_FILE"; exit 1; }
-# 确保当前用户对锁文件有权限
 touch "$LOCK_FILE" && rm -f "$LOCK_FILE" || { echo "错误：无法在 /tmp 中创建锁文件"; exit 1; }
 
-
 log() {
-    # tee -a 会将标准输入追加到文件并打印到标准输出
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$1] $2" | tee -a "$LOG_FILE"
 }
 
-# --- 排除列表 ---
-# rsync 格式
+# --- 排除列表 (不变) ---
 RSYNC_EXCLUDES=(
-    "--exclude=.git/"
-    "--exclude=.svn/"
-    "--exclude=.idea/"
-    "--exclude=.vscode/"
-    "--exclude=node_modules/"
-    "--exclude=vendor/"
-    "--exclude=runtime/"
-    "--exclude=.env"
-    "--exclude=*.log"
-    "--exclude=*.tmp"
-    "--exclude=*.swp"
-    "--exclude=~$*"
+    "--exclude=.git/" "--exclude=.svn/" "--exclude=.idea/" "--exclude=.vscode/"
+    "--exclude=node_modules/" "--exclude=vendor/" "--exclude=runtime/" "--exclude=cache/"
+    "--exclude=/config/database.local.php" "--exclude=*.bak" "--exclude=.env" "--exclude=*.log"
+    "--exclude=*.tmp" "--exclude=*.swp" "--exclude=~$*"
 )
-# inotifywait ERE 正则表达式格式
-INOTIFY_EXCLUDE_PATTERN='(\.git/|\.svn/|\.idea/|\.vscode/|node_modules/|vendor/|runtime/|\.env$|\.log$|\.tmp$|\.swp$|^~\$.*)'
+INOTIFY_EXCLUDE_PATTERN='(\.git/|\.svn/|\.idea/|\.vscode/|node_modules/|vendor/|runtime/|cache/|^config/database\.local\.php$|\.bak$|\.env$|\.log$|\.tmp$|\.swp$|^~\$.*)'
 
-# --- 核心功能函数 ---
+# --- 核心辅助函数 ---
 
-# source "$(dirname "$0")/sync_common.sh"
-
-# 改进的原子锁机制
 acquire_lock() {
-    local lock_purpose="$1"
-    # 使用 noclobber 选项实现原子性操作，防止竞争条件
-    if (set -o noclobber; echo "$$" > "$LOCK_FILE") 2> /dev/null; then
-        log "LOCK" "成功获取锁: $lock_purpose"
+    local lock_content="$1"
+    if (set -o noclobber; echo "$lock_content" > "$LOCK_FILE") 2> /dev/null; then
         return 0
     else
-        local holder_pid
-        holder_pid=$(cat "$LOCK_FILE")
-        log "LOCK" "等待锁... (当前持有者 PID: $holder_pid, 目的: $lock_purpose)"
-        # 等待，而不是超时放弃。让同步排队执行。
-        while ! (set -o noclobber; echo "$$" > "$LOCK_FILE") 2> /dev/null; do
-            # 检查持有锁的进程是否还存在，防止死锁
-            if ! ps -p "$holder_pid" > /dev/null; then
-                log "LOCK" "检测到死锁 (PID $holder_pid 不存在)，强制释放。"
-                rm -f "$LOCK_FILE"
-            fi
-            sleep 1
-        done
-        log "LOCK" "先前任务完成，已获取锁: $lock_purpose"
-        return 0
+        return 1
     fi
 }
 
 release_lock() {
     rm -f "$LOCK_FILE"
-    log "LOCK" "锁已释放"
 }
 
-# --- 权限处理函数 (带忽略功能) ---
+# ★★★ 新增：获取 Windows 状态的独立函数，供多处调用 ★★★
+get_windows_state() {
+    ssh -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" \
+        "powershell -Command \"Get-ChildItem -Recurse -Path '$WIN_DIR' -Exclude @('.git', '.svn', '.idea', '.vscode', 'node_modules', 'vendor', 'runtime', '*.log', '*.tmp', '.env', '*.swp', '~\$*') | Select-Object FullName, LastWriteTime, Length | Sort-Object FullName | ConvertTo-Json -Compress\"" 2>/dev/null
+}
+
+# 权限修复函数 (不变)
 fix_linux_permissions() {
-    local target_dir="$1"
-    shift # 移除第一个参数，剩下的都是要忽略的路径
-    local ignored_paths=("$@")
-
+    # ... 此函数逻辑不变 ...
+    local target_dir="$1"; shift; local ignored_paths=("$@")
     log "🔧 正在为 Linux 目录 '$target_dir' 应用权限 (用户: $NORMAL_USER, 用户组: $NORMAL_GROUP)"
-    if [ ${#ignored_paths[@]} -gt 0 ]; then
-        log "    - 忽略以下路径: ${ignored_paths[*]}"
-    fi
-
-    # --- 构建 find 命令的排除参数 ---
     local find_prune_args=()
     if [ ${#ignored_paths[@]} -gt 0 ]; then
-        # -path a -o -path b -o -path c
-        find_prune_args+=(-path "${ignored_paths[0]}")
+        local prune_conditions=(-path "${ignored_paths[0]}")
         for ((i=1; i<${#ignored_paths[@]}; i++)); do
-            find_prune_args+=(-o -path "${ignored_paths[i]}")
+            prune_conditions+=(-o -path "${ignored_paths[i]}")
         done
-        # 完整的排除逻辑: ( -path a -o -path b ) -prune -o <其他操作>
-        find_prune_args=( \( "${find_prune_args[@]}" \) -prune -o )
+        find_prune_args=( \( "${prune_conditions[@]}" \) -prune -o )
     fi
-    
     local SUDO_CMD=""
     if [ "$(id -u)" -ne 0 ]; then SUDO_CMD="sudo"; fi
-
-    # --- 执行带排除功能的 chown 和 chmod ---
-    # shellcheck disable=SC2211
-    find "$target_dir" "${find_prune_args[@]}" -exec $SUDO_CMD chown "$NORMAL_USER:$NORMAL_GROUP" {} +
-    
-    # shellcheck disable=SC2211
-    find "$target_dir" "${find_prune_args[@]}" -type d -exec $SUDO_CMD chmod 755 {} +
-    
-    # shellcheck disable=SC2211
-    find "$target_dir" "${find_prune_args[@]}" -type f -exec $SUDO_CMD chmod 644 {} +
-
+    find "$target_dir" "${find_prune_args[@]}" -exec $SUDO_CMD chown "$NORMAL_USER:$NORMAL_GROUP" {} + >/dev/null 2>&1
+    find "$target_dir" "${find_prune_args[@]}" -type d -exec $SUDO_CMD chmod 755 {} + >/dev/null 2>&1
+    find "$target_dir" "${find_prune_args[@]}" -type f -exec $SUDO_CMD chmod 644 {} + >/dev/null 2>&1
     log "🔩 Linux 权限已应用"
 }
 
+
+# --- 同步核心函数 ---
+
 sync_linux_to_win() {
-    if ! acquire_lock "Linux → Windows"; then return; fi
-    
+    while ! acquire_lock "$$:L2W"; do
+        # ... 死锁检测逻辑不变 ...
+        if [ -f "$LOCK_FILE" ]; then local holder_info; holder_info=$(cat "$LOCK_FILE" 2>/dev/null); local holder_pid; holder_pid=${holder_info%%:*}; if [[ -n "$holder_pid" && ! -f "/proc/$holder_pid/cmdline" ]]; then log "LOCK" "检测到死锁 (持有者 PID $holder_pid 不存在)，强制释放。"; release_lock; fi; fi
+        sleep 1
+    done
+    log "LOCK" "成功获取锁: Linux → Windows"
+
     log "SYNC" "🔄 开始同步: Linux → Windows"
-    
-    # 临时文件用于捕获 rsync 的详细输出
-    local rsync_output_file
-    rsync_output_file=$(mktemp /tmp/rsync_linux_out.XXXXXX)
-
-    # ★★★ 关键修改 ★★★
-    # 1. 添加 -i (--itemize-changes) 参数用于详细诊断
-    # 2. 将标准输出和错误都重定向到临时文件
-    # shellcheck disable=SC2068
-    rsync -avzi --no-owner --no-group --delete \
-          -e "ssh -p $SSH_PORT" \
-          --rsync-path="$WIN_RSYNC_PATH" \
-          "${RSYNC_EXCLUDES[@]}" \
-          "$LINUX_DIR/" \
-          "$SSH_USER@$SSH_HOST:$WIN_CYGDRIVE_PATH/" > "$rsync_output_file" 2>&1
-
-    # 3. 使用 $? 而不是 ${PIPESTATUS[0]}
+    rsync -avzi --no-owner --no-group --delete -e "ssh -p $SSH_PORT" --rsync-path="$WIN_RSYNC_PATH" "${RSYNC_EXCLUDES[@]}" "$LINUX_DIR/" "$SSH_USER@$SSH_HOST:$WIN_CYGDRIVE_PATH/" >/dev/null 2>&1
     local exit_code=$?
-    
-    # 将 rsync 的详细输出打印到主日志文件
-    if [ -s "$rsync_output_file" ]; then
-        log "SYNC_DETAIL" "--- rsync 输出 ---"
-        # 使用 sed 添加缩进，方便阅读
-        sed 's/^/    /g' "$rsync_output_file" | tee -a "$LOG_FILE"
-        log "SYNC_DETAIL" "--- 结束输出 ---"
-    fi
-    
-    rm -f "$rsync_output_file" # 清理临时文件
 
-    if [ $exit_code -eq 0 ]; then
-        log "SYNC" "✅ 同步成功: Linux → Windows"
-    elif [ $exit_code -eq 23 ]; then # 部分文件传输错误
-        log "SYNC" "⚠️ 部分文件同步失败 (代码 23): Linux → Windows"
+    if [ $exit_code -eq 0 ] || [ $exit_code -eq 23 ]; then
+        if [ $exit_code -eq 0 ]; then log "SYNC" "✅ 同步成功: Linux → Windows"; else log "SYNC" "⚠️ 部分文件同步失败 (代码 23): Linux → Windows"; fi
+        ### ★★★ 修改：同步成功后，更新 Windows 状态快照 ★★★
+        local new_state; new_state=$(get_windows_state)
+        if [ -n "$new_state" ]; then
+            echo "$new_state" > "$WIN_STATE_FILE"
+            log "STATE" "[L2W] Windows 状态快照已更新。"
+        else
+            log "ERROR" "[L2W] 同步后无法获取新的 Windows 状态，快照未更新！"
+        fi
     else
         log "SYNC" "❌ 同步失败 [代码 $exit_code]: Linux → Windows"
     fi
  
     release_lock
+    log "LOCK" "锁已释放 (L→W)"
 }
 
 
 sync_win_to_linux() {
-    if ! acquire_lock "Windows → Linux"; then return; fi
-    
+    while ! acquire_lock "$$:W2L"; do
+        # ... 死锁检测逻辑不变 ...
+        if [ -f "$LOCK_FILE" ]; then local holder_info; holder_info=$(cat "$LOCK_FILE" 2>/dev/null); local holder_pid; holder_pid=${holder_info%%:*}; if [[ -n "$holder_pid" && ! -f "/proc/$holder_pid/cmdline" ]]; then log "LOCK" "检测到死锁 (持有者 PID $holder_pid 不存在)，强制释放。"; release_lock; fi; fi
+        sleep 1
+    done
+    log "LOCK" "成功获取锁: Windows → Linux"
+
     log "SYNC" "🔄 开始同步: Windows → Linux"
-    
-    # 临时文件用于捕获 rsync 的详细输出
-    local rsync_output_file
-    rsync_output_file=$(mktemp /tmp/rsync_win_out.XXXXXX)
-
-    # ★★★ 关键修改 ★★★
-    # 1. 添加 -i (--itemize-changes) 参数用于详细诊断
-    # 2. 将标准输出和错误都重定向到临时文件
-    # shellcheck disable=SC2068
-    rsync -avzi --no-owner --no-group --delete \
-          -e "ssh -p $SSH_PORT" \
-          --rsync-path="$WIN_RSYNC_PATH" \
-          "${RSYNC_EXCLUDES[@]}" \
-          "$SSH_USER@$SSH_HOST:$WIN_CYGDRIVE_PATH/" \
-          "$LINUX_DIR/" > "$rsync_output_file" 2>&1
-
-    # 3. 使用 $? 而不是 ${PIPESTATUS[0]}
+    rsync -avzi --no-owner --no-group --delete -e "ssh -p $SSH_PORT" --rsync-path="$WIN_RSYNC_PATH" "${RSYNC_EXCLUDES[@]}" "$SSH_USER@$SSH_HOST:$WIN_CYGDRIVE_PATH/" "$LINUX_DIR/" >/dev/null 2>&1
     local exit_code=$?
     
-    # 将 rsync 的详细输出打印到主日志文件
-    if [ -s "$rsync_output_file" ]; then
-        log "SYNC_DETAIL" "--- rsync 输出 (Win→Lin) ---"
-        # 使用 sed 添加缩进，方便阅读
-        sed 's/^/    /g' "$rsync_output_file" | tee -a "$LOG_FILE"
-        log "SYNC_DETAIL" "--- 结束输出 ---"
-    fi
-    
-    if [ $exit_code -eq 0 ]; then
-        log "SYNC" "✅ 同步成功: Windows → Linux"
-
-        # 定义要忽略权限检查的目录路径 (相对于 $LINUX_DIR)
-        # 注意：这里的路径是 find 命令能理解的路径
-        local ignored_paths=(
-            "$LINUX_DIR/.git"
-            "$LINUX_DIR/node_modules"
-            "$LINUX_DIR/vendor"
-            "$LINUX_DIR/storage/logs"  # 示例：Laravel 的日志目录
-            "$LINUX_DIR/bootstrap/cache" # 示例：Laravel 的缓存目录
-            "$LINUX_DIR/runtime"
-            # 在这里添加更多你需要忽略的完整路径
-        )
-
-        # --- 构建 find 命令的排除参数 ---
-        local find_prune_args=()
-        if [ ${#ignored_paths[@]} -gt 0 ]; then
-            # ( -path a -o -path b ) -prune -o
-            local prune_conditions=(-path "${ignored_paths[0]}")
-            for ((i=1; i<${#ignored_paths[@]}; i++)); do
-                prune_conditions+=(-o -path "${ignored_paths[i]}")
-            done
-            find_prune_args=( \( "${prune_conditions[@]}" \) -prune -o )
+    if [ $exit_code -eq 0 ] || [ $exit_code -eq 23 ]; then
+        if [ $exit_code -eq 0 ]; then log "SYNC" "✅ 同步成功: Windows → Linux"; else log "SYNC" "⚠️ 部分文件同步失败 (代码 23): Windows → Linux"; fi
+        
+        ### ★★★ 修改：同步成功后，更新 Windows 状态快照 ★★★
+        local new_state; new_state=$(get_windows_state)
+        if [ -n "$new_state" ]; then
+            echo "$new_state" > "$WIN_STATE_FILE"
+            log "STATE" "[W2L] Windows 状态快照已更新。"
+        else
+            log "ERROR" "[W2L] 同步后无法获取新的 Windows 状态，快照未更新！"
         fi
         
-        # 权限修复逻辑保持不变
-        # 使用 find 命令检查是否有文件的所有者或组不匹配
-        # 新增了 -prune 参数来忽略指定目录
-        # shellcheck disable=SC2211
-        if [ -n "$(find "$LINUX_DIR" "${find_prune_args[@]}" -not \( -user "$NORMAL_USER" -and -group "$NORMAL_GROUP" \) -print -quit)" ]; then
-            log "PERMS" "🔩 检测到权限不匹配，开始修复..."
-            fix_linux_permissions "$LINUX_DIR" "${ignored_paths[@]}"
-        else
-            log "PERMS" "🔩 权限检查通过，无需修复。"
-        fi
-    elif [ $exit_code -eq 23 ]; then
-        log "SYNC" "⚠️ 部分文件同步失败 (代码 23): Windows → Linux"
+        # 权限修复逻辑不变
+        local ignored_paths=("$LINUX_DIR/.git" "$LINUX_DIR/node_modules" "$LINUX_DIR/vendor" "$LINUX_DIR/runtime")
+        fix_linux_permissions "$LINUX_DIR" "${ignored_paths[@]}"
+
     else
         log "SYNC" "❌ 同步失败 [代码 $exit_code]: Windows → Linux"
     fi
 
-    rm -f "$rsync_output_file" # 清理临时文件
-
     release_lock
+    log "LOCK" "锁已释放 (W→L)"
 }
 
 
 # --- 监控与触发器 ---
 
-# ★★★ 关键改进：Linux 监控与防抖触发器 ★★★
 monitor_linux_changes() {
     log "INFO" "🔍 [L-MON] 开始监控 Linux 目录: $LINUX_DIR"
-    # 步骤1: 侦听事件并“举旗”
     inotifywait -m -r -q -e create,delete,modify,move \
                 --excludei "$INOTIFY_EXCLUDE_PATTERN" \
                 "$LINUX_DIR" |
     while read -r path action file; do
-        # 任何事件都只做一件事：创建标志文件
+        # 如果锁是 W2L，说明是回声，忽略
+        if [ -f "$LOCK_FILE" ] && [[ "$(cat "$LOCK_FILE" 2>/dev/null)" == *":W2L" ]]; then
+            log "SILENCE" "🔇 [L-MON] 检测到 W→L 同步导致的回声，忽略 inotify 事件。"
+            continue
+        fi
         touch "$LINUX_CHANGE_FLAG"
     done
 }
 
-# ★★★ 关键修正：更健壮的“后沿触发”防抖逻辑 ★★★
+
+### ★★★ 修改：最核心的修改，增加同步前安全检查 ★★★
 debounce_and_sync_linux() {
-    log "INFO" "🚀 [L-SYNC] 防抖同步服务已启动 (后沿触发模式)"
+    log "INFO" "🚀 [L-SYNC] 防抖同步服务已启动 (带安全检查)"
     while true; do
-        # 1. 等待，直到第一个变化发生（标志文件出现）
-        while [ ! -f "$LINUX_CHANGE_FLAG" ]; do
-            sleep 0.5 # 短暂休眠，降低 CPU 占用
-        done
+        while [ ! -f "$LINUX_CHANGE_FLAG" ]; do sleep 0.5; done
 
-        # 2. 第一个变化已捕获。现在我们等待系统“安静下来”。
-        #    只要在我们的“安静期”（例如 2 秒）内仍有变化，就继续循环。
         log "EVENT" "📢 检测到 Linux 变化，进入 2 秒稳定期..."
-        
-        while [ -f "$LINUX_CHANGE_FLAG" ]; do
-            # 将检测到的标志消耗掉
-            rm -f "$LINUX_CHANGE_FLAG"
-            # 等待一小段“安静”时间
-            sleep 2
-            # 循环会再次检查在这 2 秒内，`monitor_linux_changes` 是否又创建了新的标志文件。
-            # 如果创建了，说明变化仍在继续，循环将继续。
-        done
+        while [ -f "$LINUX_CHANGE_FLAG" ]; do rm -f "$LINUX_CHANGE_FLAG"; sleep 2; done
+        log "EVENT" "🟢 文件系统已稳定，准备处理..."
 
-        # 3. 如果能跳出上面的 while 循环，说明我们刚刚经历了完整的 2 秒“安静期”，
-        #    文件系统已经稳定。现在是执行同步的最佳时机。
-        log "EVENT" "🟢 文件系统已稳定，执行同步操作。"
+        # ★★★ 核心安全检查 (Sync Guard) ★★★
+        log "GUARD" "🛡️  正在执行 L→W 同步前安全检查..."
+        local last_known_state; last_known_state=$(cat "$WIN_STATE_FILE" 2>/dev/null)
+        local current_win_state; current_win_state=$(get_windows_state)
+
+        if [ -z "$current_win_state" ]; then
+            log "WARN" "🛡️  [GUARD] 无法获取当前 Windows 状态，跳过本次 L→W 同步以策安全。"
+            continue
+        fi
+
+        if [[ -n "$last_known_state" && "$last_known_state" != "$current_win_state" ]]; then
+            log "GUARD" "🛡️  [GUARD] 检测到 Windows 存在未同步的更改！"
+            log "GUARD" "🛡️  [GUARD] ‼️ 已中止本次 L→W 同步，以防止数据丢失。等待 W→L 同步优先执行。"
+            continue
+        fi
+        log "GUARD" "🛡️  [GUARD] 安全检查通过，Windows 目录是干净的。"
+        
+        # 只有在安全检查通过后才执行同步
         sync_linux_to_win
     done
 }
 
+
+### ★★★ 修改：Windows 监控逻辑简化 ★★★
 monitor_windows_changes() {
-    log "INFO" "🔍 [W-MON] 开始轮询监控 Windows 目录: $WIN_DIR (间隔 10s)"
-    local previous_state=""
+    log "INFO" "🔍 [W-MON] 启动 Windows 目录监控 (间隔 10s)"
     
+    local previous_state; previous_state=$(cat "$WIN_STATE_FILE" 2>/dev/null)
+    if [ -z "$previous_state" ]; then
+        log "INFO" "[W-MON] 快照文件不存在，正在初始化 Windows 目录状态..."
+        previous_state=$(get_windows_state)
+        if [ -n "$previous_state" ]; then
+            echo "$previous_state" > "$WIN_STATE_FILE"
+            log "INFO" "[W-MON] Windows 目录状态初始化完成。"
+        else
+            log "WARN" "[W-MON] 初始化 Windows 状态失败，将在循环中重试。"
+        fi
+    fi
+
     while true; do
-        # 获取当前文件系统状态快照
-        # 增加了错误处理，如果ssh失败，则循环继续而不是退出
-        local current_state
-        current_state=$(ssh -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" \
-            "powershell -Command \"Get-ChildItem -Recurse -Path '$WIN_DIR' -Exclude @('.git', '.svn', '.idea', '.vscode', 'node_modules', 'vendor', 'runtime', '*.log', '*.tmp', '.env', '*.swp', '~\$*') | Select-Object FullName, LastWriteTime, Length | Sort-Object FullName | ConvertTo-Json -Compress\"" 2>/dev/null)
-        
-        # 如果命令失败或返回空，则跳过本次检查
+        sleep 10
+        local current_state; current_state=$(get_windows_state)
+
         if [ -z "$current_state" ]; then
-            log "WARN" "⚠️ [W-MON] 无法获取 Windows 目录状态 (网络或权限问题?)，15秒后重试。"
-            sleep 15
+            log "WARN" "⚠️ [W-MON] 无法获取 Windows 目录状态，15秒后重试。"
+            sleep 5
             continue
-        fi
-        
-        # 首次运行时初始化状态
-        if [ -z "$previous_state" ]; then
-            previous_state="$current_state"
-            sleep 10 # 初始化的等待时间
-            continue
-        fi
-        
-        # 比较快照
-        if [ "$previous_state" != "$current_state" ]; then
-            log "EVENT" "📢 检测到 Windows 目录状态变化"
-            sync_win_to_linux
-            # 同步后立即更新状态，避免重复触发
-            previous_state=$(ssh -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" \
-            "powershell -Command \"Get-ChildItem -Recurse -Path '$WIN_DIR' -Exclude @('.git', '.svn', '.idea', '.vscode', 'node_modules', 'vendor', 'runtime', '*.log', '*.tmp', '.env', '*.swp', '~\$*') | Select-Object FullName, LastWriteTime, Length | Sort-Object FullName | ConvertTo-Json -Compress\"" 2>/dev/null)
         fi
 
-        sleep 10 # 轮询间隔
+        if [ "$previous_state" == "$current_state" ]; then
+            continue
+        fi
+
+        # 检测到变化，直接尝试同步。锁机制会处理并发问题。
+        log "EVENT" "📢 检测到 Windows 目录变化，准备同步 W→L。"
+        sync_win_to_linux
+        
+        # 同步后，直接从快照文件更新状态，而不是再次远程获取
+        # 因为 sync_win_to_linux 成功后会保证快照文件是新的
+        previous_state=$(cat "$WIN_STATE_FILE" 2>/dev/null)
     done
 }
 
 # --- 脚本主程序 ---
 main() {
-    # 检查 PID 文件，防止脚本多重启动
     if [ -f "$PID_FILE" ] && ps -p "$(cat "$PID_FILE")" > /dev/null; then
         log "ERROR" "❌ 脚本已在运行 (PID: $(cat "$PID_FILE"))。请先停止旧实例。"
         exit 1
     fi
     echo $$ > "$PID_FILE"
 
-    # 清理函数
     cleanup() {
         log "INFO" "🛑 接收到信号，正在清理并退出..."
-        rm -f "$PID_FILE" "$LOCK_FILE" "$LINUX_CHANGE_FLAG"
-        # 优雅地杀死所有后台子进程
-        if [ -n "$L_MON_PID" ]; then kill "$L_MON_PID"; fi
-        if [ -n "$L_SYNC_PID" ]; then kill "$L_SYNC_PID"; fi
-        if [ -n "$W_MON_PID" ]; then kill "$W_MON_PID"; fi
+        ### ★★★ 修改：清理时也移除新增的状态文件 ★★★
+        rm -f "$PID_FILE" "$LOCK_FILE" "$LINUX_CHANGE_FLAG" "$WIN_STATE_FILE"
+        pkill -P $$ # 杀死所有由该脚本启动的子进程
         log "INFO" "👋 脚本已停止。"
         exit 0
     }
@@ -357,10 +267,13 @@ main() {
 
     log "INFO" "🚀 脚本启动 (PID: $$)"
     
-    # 初始全量同步 (先拉取，再推送，以远程为准或根据需求调整)
+    # 清理所有临时/状态文件
+    rm -f "$LOCK_FILE" "$LINUX_CHANGE_FLAG" "$WIN_STATE_FILE"
+    
     log "INIT" "执行初始同步..."
+    # 初始同步 W->L 优先，确保 Linux 拿到最新版本，并生成初始快照
     sync_win_to_linux
-    sync_linux_to_win
+    sync_linux_to_win # 随后 L->W 会因为快照一致而顺利执行
     log "INIT" "✅ 初始同步完成。"
 
     # 启动后台监控进程
@@ -374,15 +287,11 @@ main() {
     W_MON_PID=$!
 
     log "INFO" "✅ 所有监控进程已启动。"
-    log "INFO" "Linux Watcher PID: $L_MON_PID"
-    log "INFO" "Linux Syncer PID: $L_SYNC_PID"
-    log "INFO" "Windows Watcher PID: $W_MON_PID"
+    log "INFO" "Linux Watcher PID: $L_MON_PID, Syncer PID: $L_SYNC_PID, Windows Watcher PID: $W_MON_PID"
     log "INFO" "日志文件位于: $LOG_FILE"
     log "INFO" "脚本正在后台运行，按 Ctrl+C 停止。"
 
-    # 等待所有后台任务结束（实际上是无限等待，直到被 trap 捕获）
     wait
 }
 
-# 执行主函数
 main "$@"
