@@ -18,13 +18,6 @@ PID_FILE="/tmp/www_sync.pid"
 # 用于防抖的临时标志文件
 LINUX_CHANGE_FLAG="/tmp/linux_change.flag"
 
-### 新增：同步静默功能相关配置 ###
-# 用于防止同步回声的状态文件
-LAST_SYNC_DIR_FILE="/tmp/www_last_sync_dir"
-LAST_SYNC_TIME_FILE="/tmp/www_last_sync_time"
-# 在一次同步后，忽略反向“回声”变化的秒数
-SILENCE_PERIOD=15
-
 # 普通用户（用于权限修复）
 NORMAL_USER="amei"
 NORMAL_GROUP="amei"
@@ -43,7 +36,6 @@ log() {
 }
 
 # --- 排除列表 ---
-
 # rsync 格式
 RSYNC_EXCLUDES=(
     "--exclude=.git/"
@@ -53,43 +45,18 @@ RSYNC_EXCLUDES=(
     "--exclude=node_modules/"
     "--exclude=vendor/"
     "--exclude=runtime/"
-    # --- 新增规则 ---
-    "--exclude=cache/"                 # 1. 排除所有名为 'cache' 的子目录
-    "--exclude=/config/database.local.php" # 2. 排除根目录下的特定文件
-    "--exclude=*.bak"                  # 3. 排除所有 .bak 文件
-    # --- 原有规则 ---
     "--exclude=.env"
     "--exclude=*.log"
     "--exclude=*.tmp"
     "--exclude=*.swp"
     "--exclude=~$*"
 )
-
 # inotifywait ERE 正则表达式格式
-# 注意：每个模式用 | (或) 分隔
-INOTIFY_EXCLUDE_PATTERN='(
-    \.git/|
-    \.svn/|
-    \.idea/|
-    \.vscode/|
-    node_modules/|
-    vendor/|
-    runtime/|
-    # --- 新增规则 (与 rsync 对应) ---
-    cache/|                            # 1. 匹配任何路径下的 'cache/'
-    ^config/database\.local\.php$|     # 2. 匹配根目录下精确的文件名 (注意^ $和\.的使用)
-    \.bak$|                            # 3. 匹配以 .bak 结尾的文件
-    # --- 原有规则 ---
-    \.env$|
-    \.log$|
-    \.tmp$|
-    \.swp$|
-    ^~\$.*
-)'
-# 为了可读性，我将正则表达式拆分成了多行。在shell中，这会被合并为一行。
-INOTIFY_EXCLUDE_PATTERN=$(echo "$INOTIFY_EXCLUDE_PATTERN" | tr -d ' \n')
+INOTIFY_EXCLUDE_PATTERN='(\.git/|\.svn/|\.idea/|\.vscode/|node_modules/|vendor/|runtime/|\.env$|\.log$|\.tmp$|\.swp$|^~\$.*)'
 
 # --- 核心功能函数 ---
+
+# source "$(dirname "$0")/sync_common.sh"
 
 # 改进的原子锁机制
 acquire_lock() {
@@ -128,9 +95,9 @@ fix_linux_permissions() {
     local ignored_paths=("$@")
 
     log "🔧 正在为 Linux 目录 '$target_dir' 应用权限 (用户: $NORMAL_USER, 用户组: $NORMAL_GROUP)"
-    # if [ ${#ignored_paths[@]} -gt 0 ]; then
-    #     log "    - 忽略以下路径: ${ignored_paths[*]}"
-    # fi
+    if [ ${#ignored_paths[@]} -gt 0 ]; then
+        log "    - 忽略以下路径: ${ignored_paths[*]}"
+    fi
 
     # --- 构建 find 命令的排除参数 ---
     local find_prune_args=()
@@ -162,12 +129,16 @@ fix_linux_permissions() {
 
 sync_linux_to_win() {
     if ! acquire_lock "Linux → Windows"; then return; fi
+    
     log "SYNC" "🔄 开始同步: Linux → Windows"
     
+    # 临时文件用于捕获 rsync 的详细输出
     local rsync_output_file
     rsync_output_file=$(mktemp /tmp/rsync_linux_out.XXXXXX)
 
-    # rsync 命令本身不变 (为简洁起见，省略输出重定向和日志解析)
+    # ★★★ 关键修改 ★★★
+    # 1. 添加 -i (--itemize-changes) 参数用于详细诊断
+    # 2. 将标准输出和错误都重定向到临时文件
     # shellcheck disable=SC2068
     rsync -avzi --no-owner --no-group --delete \
           -e "ssh -p $SSH_PORT" \
@@ -175,14 +146,22 @@ sync_linux_to_win() {
           "${RSYNC_EXCLUDES[@]}" \
           "$LINUX_DIR/" \
           "$SSH_USER@$SSH_HOST:$WIN_CYGDRIVE_PATH/" > "$rsync_output_file" 2>&1
+
+    # 3. 使用 $? 而不是 ${PIPESTATUS[0]}
     local exit_code=$?
+    
+    # 将 rsync 的详细输出打印到主日志文件
+    if [ -s "$rsync_output_file" ]; then
+        log "SYNC_DETAIL" "--- rsync 输出 ---"
+        # 使用 sed 添加缩进，方便阅读
+        sed 's/^/    /g' "$rsync_output_file" | tee -a "$LOG_FILE"
+        log "SYNC_DETAIL" "--- 结束输出 ---"
+    fi
+    
     rm -f "$rsync_output_file" # 清理临时文件
 
     if [ $exit_code -eq 0 ]; then
         log "SYNC" "✅ 同步成功: Linux → Windows"
-        ### 新增：记录本次成功的同步方向和时间 ###
-        echo "L2W" > "$LAST_SYNC_DIR_FILE"
-        date +%s > "$LAST_SYNC_TIME_FILE"
     elif [ $exit_code -eq 23 ]; then # 部分文件传输错误
         log "SYNC" "⚠️ 部分文件同步失败 (代码 23): Linux → Windows"
     else
@@ -195,11 +174,16 @@ sync_linux_to_win() {
 
 sync_win_to_linux() {
     if ! acquire_lock "Windows → Linux"; then return; fi
+    
     log "SYNC" "🔄 开始同步: Windows → Linux"
     
+    # 临时文件用于捕获 rsync 的详细输出
     local rsync_output_file
     rsync_output_file=$(mktemp /tmp/rsync_win_out.XXXXXX)
 
+    # ★★★ 关键修改 ★★★
+    # 1. 添加 -i (--itemize-changes) 参数用于详细诊断
+    # 2. 将标准输出和错误都重定向到临时文件
     # shellcheck disable=SC2068
     rsync -avzi --no-owner --no-group --delete \
           -e "ssh -p $SSH_PORT" \
@@ -207,15 +191,20 @@ sync_win_to_linux() {
           "${RSYNC_EXCLUDES[@]}" \
           "$SSH_USER@$SSH_HOST:$WIN_CYGDRIVE_PATH/" \
           "$LINUX_DIR/" > "$rsync_output_file" 2>&1
+
+    # 3. 使用 $? 而不是 ${PIPESTATUS[0]}
     local exit_code=$?
-    rm -f "$rsync_output_file" # 清理临时文件
+    
+    # 将 rsync 的详细输出打印到主日志文件
+    if [ -s "$rsync_output_file" ]; then
+        log "SYNC_DETAIL" "--- rsync 输出 (Win→Lin) ---"
+        # 使用 sed 添加缩进，方便阅读
+        sed 's/^/    /g' "$rsync_output_file" | tee -a "$LOG_FILE"
+        log "SYNC_DETAIL" "--- 结束输出 ---"
+    fi
     
     if [ $exit_code -eq 0 ]; then
         log "SYNC" "✅ 同步成功: Windows → Linux"
-
-        ### 新增：记录本次成功的同步方向和时间 ###
-        echo "W2L" > "$LAST_SYNC_DIR_FILE"
-        date +%s > "$LAST_SYNC_TIME_FILE"
 
         # 定义要忽略权限检查的目录路径 (相对于 $LINUX_DIR)
         # 注意：这里的路径是 find 命令能理解的路径
@@ -226,7 +215,6 @@ sync_win_to_linux() {
             "$LINUX_DIR/storage/logs"  # 示例：Laravel 的日志目录
             "$LINUX_DIR/bootstrap/cache" # 示例：Laravel 的缓存目录
             "$LINUX_DIR/runtime"
-            "$LINUX_DIR/web/temp"
             # 在这里添加更多你需要忽略的完整路径
         )
 
@@ -257,6 +245,7 @@ sync_win_to_linux() {
         log "SYNC" "❌ 同步失败 [代码 $exit_code]: Windows → Linux"
     fi
 
+    rm -f "$rsync_output_file" # 清理临时文件
 
     release_lock
 }
@@ -291,114 +280,56 @@ debounce_and_sync_linux() {
         log "EVENT" "📢 检测到 Linux 变化，进入 2 秒稳定期..."
         
         while [ -f "$LINUX_CHANGE_FLAG" ]; do
+            # 将检测到的标志消耗掉
             rm -f "$LINUX_CHANGE_FLAG"
+            # 等待一小段“安静”时间
             sleep 2
+            # 循环会再次检查在这 2 秒内，`monitor_linux_changes` 是否又创建了新的标志文件。
+            # 如果创建了，说明变化仍在继续，循环将继续。
         done
 
-         ### 新增：检查是否需要“同步静默” ###
-        local last_dir=""
-        local last_time=0
-        # 读取上一次同步的状态
-        if [ -f "$LAST_SYNC_DIR_FILE" ]; then last_dir=$(cat "$LAST_SYNC_DIR_FILE"); fi
-        if [ -f "$LAST_SYNC_TIME_FILE" ]; then last_time=$(cat "$LAST_SYNC_TIME_FILE"); fi
-        
-        local current_time
-        current_time=$(date +%s)
-        
-        # 如果上一次同步是 W→L，并且发生时间在静默期内，则跳过本次同步
-        if [[ "$last_dir" == "W2L" && $((current_time - last_time)) -lt $SILENCE_PERIOD ]]; then
-            log "SILENCE" "🔇 [L-SYNC] 忽略 Linux 变化，因为它可能是由最近的 W→L 同步引起的。"
-            continue # 直接进入下一次循环，跳过本次同步
-        fi
-
+        # 3. 如果能跳出上面的 while 循环，说明我们刚刚经历了完整的 2 秒“安静期”，
+        #    文件系统已经稳定。现在是执行同步的最佳时机。
         log "EVENT" "🟢 文件系统已稳定，执行同步操作。"
         sync_linux_to_win
     done
 }
 
-### 最终修复版：带有“二次验证”逻辑的 Windows 监控函数 ###
 monitor_windows_changes() {
-    log "INFO" "🔍 [W-MON] 启动 Windows 目录监控 (二次验证模式，间隔 10s)"
-    
+    log "INFO" "🔍 [W-MON] 开始轮询监控 Windows 目录: $WIN_DIR (间隔 10s)"
     local previous_state=""
-    # 新增状态变量，用于存储待验证的潜在回声状态
-    local potential_echo_state="" 
-
-    # 辅助函数，避免代码重复
-    get_windows_state() {
-        ssh -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" \
-            "powershell -Command \"Get-ChildItem -Recurse -Path '$WIN_DIR' -Exclude @('.git', '.svn', '.idea', '.vscode', 'node_modules', 'vendor', 'runtime', '*.log', '*.tmp', '.env', '*.swp', '~\$*') | Select-Object FullName, LastWriteTime, Length | Sort-Object FullName | ConvertTo-Json -Compress\"" 2>/dev/null
-    }
-
-    # 首次运行时初始化基准状态
-    previous_state=$(get_windows_state)
-    log "INFO" "[W-MON] Windows 目录状态初始化完成。"
-
+    
     while true; do
-        sleep 10 # 固定的轮询间隔
-        
+        # 获取当前文件系统状态快照
+        # 增加了错误处理，如果ssh失败，则循环继续而不是退出
         local current_state
-        current_state=$(get_windows_state)
-
-        if [ -z "$current_state" ]; then
-            log "WARN" "⚠️ [W-MON] 无法获取 Windows 目录状态，15秒后重试。"
-            sleep 5 # 额外的等待
-            continue
-        fi
-
-        # 如果状态无变化，则重置“待验证”状态并继续
-        if [ "$previous_state" == "$current_state" ]; then
-            potential_echo_state="" # 系统稳定，清除待验证标记
-            continue
-        fi
-
-        # --- 状态有变化，进入核心判断逻辑 ---
-
-        # 检查是否是 L->W 同步造成的回声
-        local last_dir=""
-        local last_time=0
-        if [ -f "$LAST_SYNC_DIR_FILE" ]; then last_dir=$(cat "$LAST_SYNC_DIR_FILE"); fi
-        if [ -f "$LAST_SYNC_TIME_FILE" ]; then last_time=$(cat "$LAST_SYNC_TIME_FILE"); fi
-        local time_now=$(date +%s)
-
-        is_in_silence_period=false
-        if [[ "$last_dir" == "L2W" && $((time_now - last_time)) -lt $SILENCE_PERIOD ]]; then
-            is_in_silence_period=true
-        fi
-
-        # --- 决策树 ---
-        # 场景1：当前变化发生在静默期内 -> 可能是回声，进入“待验证”
-        if $is_in_silence_period && [ -z "$potential_echo_state" ]; then
-            log "SILENCE" "🔇 [W-MON] 检测到潜在回声。进入二次验证模式..."
-            potential_echo_state="$current_state"
-            previous_state="$current_state" # 更新基准以检测下一次变化
-            continue
-
-        # 场景2：之前已进入“待验证”，且当前状态与“待验证”时一致 -> 确认是纯回声，忽略
-        elif [ -n "$potential_echo_state" ] && [ "$potential_echo_state" == "$current_state" ]; then
-            log "SILENCE" "✅ [W-MON] 二次验证通过。确认是纯净的回声，已忽略。"
-            potential_echo_state="" # 清除待验证状态
-            previous_state="$current_state" # 最终确认基准
-            continue
+        current_state=$(ssh -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" \
+            "powershell -Command \"Get-ChildItem -Recurse -Path '$WIN_DIR' -Exclude @('.git', '.svn', '.idea', '.vscode', 'node_modules', 'vendor', 'runtime', '*.log', '*.tmp', '.env', '*.swp', '~\$*') | Select-Object FullName, LastWriteTime, Length | Sort-Object FullName | ConvertTo-Json -Compress\"" 2>/dev/null)
         
-        # 场景3：任何其他情况 (不在静默期 / 或在静默期但已有新变化) -> 必须同步
-        else
-            log "EVENT" "📢 检测到需要同步的 Windows 目录变化。"
-            
-            # 如果是从“待验证”状态过来的，说明有合法修改混入
-            if [ -n "$potential_echo_state" ]; then
-                log "INFO" "[W-MON] 二次验证失败：在观察期内检测到新的用户修改。"
-                potential_echo_state="" # 清除待验证状态
-            fi
-
-            sync_win_to_linux
-            
-            # 同步后，必须用最新状态更新基准，确保一致性
-            previous_state=$(get_windows_state)
-            if [ -z "$previous_state" ]; then
-                log "WARN" "[W-MON] 同步后更新状态失败，将在下次循环重新初始化。"
-            fi
+        # 如果命令失败或返回空，则跳过本次检查
+        if [ -z "$current_state" ]; then
+            log "WARN" "⚠️ [W-MON] 无法获取 Windows 目录状态 (网络或权限问题?)，15秒后重试。"
+            sleep 15
+            continue
         fi
+        
+        # 首次运行时初始化状态
+        if [ -z "$previous_state" ]; then
+            previous_state="$current_state"
+            sleep 10 # 初始化的等待时间
+            continue
+        fi
+        
+        # 比较快照
+        if [ "$previous_state" != "$current_state" ]; then
+            log "EVENT" "📢 检测到 Windows 目录状态变化"
+            sync_win_to_linux
+            # 同步后立即更新状态，避免重复触发
+            previous_state=$(ssh -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" \
+            "powershell -Command \"Get-ChildItem -Recurse -Path '$WIN_DIR' -Exclude @('.git', '.svn', '.idea', '.vscode', 'node_modules', 'vendor', 'runtime', '*.log', '*.tmp', '.env', '*.swp', '~\$*') | Select-Object FullName, LastWriteTime, Length | Sort-Object FullName | ConvertTo-Json -Compress\"" 2>/dev/null)
+        fi
+
+        sleep 10 # 轮询间隔
     done
 }
 
@@ -425,9 +356,6 @@ main() {
     trap cleanup SIGINT SIGTERM
 
     log "INFO" "🚀 脚本启动 (PID: $$)"
-
-    ### 新增：在启动时清理旧的状态文件 ###
-    rm -f "$LAST_SYNC_DIR_FILE" "$LAST_SYNC_TIME_FILE" "$LINUX_CHANGE_FLAG"
     
     # 初始全量同步 (先拉取，再推送，以远程为准或根据需求调整)
     log "INIT" "执行初始同步..."
