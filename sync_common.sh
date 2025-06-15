@@ -67,18 +67,12 @@ fix_linux_permissions() {
     log "🔩 Linux 权限已应用"
 }
 
+# === sync_linux_to_win (无锁版) ===
 sync_linux_to_win() {
-    if ! acquire_lock "Linux → Windows"; then return; fi
-    
     log "SYNC" "🔄 开始同步: Linux → Windows"
     
-    # 临时文件用于捕获 rsync 的详细输出
-    local rsync_output_file
-    rsync_output_file=$(mktemp /tmp/rsync_linux_out.XXXXXX)
+    local rsync_output_file; rsync_output_file=$(mktemp /tmp/rsync_linux_out.XXXXXX)
 
-    # ★★★ 关键修改 ★★★
-    # 1. 添加 -i (--itemize-changes) 参数用于详细诊断
-    # 2. 将标准输出和错误都重定向到临时文件
     # shellcheck disable=SC2068
     rsync -avzi --no-owner --no-group --delete \
           -e "ssh -p $SSH_PORT" \
@@ -86,47 +80,31 @@ sync_linux_to_win() {
           "${RSYNC_EXCLUDES[@]}" \
           "$LINUX_DIR/" \
           "$SSH_USER@$SSH_HOST:$WIN_CYGDRIVE_PATH/" > "$rsync_output_file" 2>&1
-
-    # 3. 使用 $? 而不是 ${PIPESTATUS[0]}
     local exit_code=$?
     
-    # 将 rsync 的详细输出打印到主日志文件
     if [ -s "$rsync_output_file" ]; then
-        log "SYNC_DETAIL" "--- rsync 输出 ---"
-        # 使用 sed 添加缩进，方便阅读
+        log "SYNC_DETAIL" "--- rsync 输出 (Lin→Win) ---"
         sed 's/^/    /g' "$rsync_output_file" | tee -a "$LOG_FILE"
         log "SYNC_DETAIL" "--- 结束输出 ---"
     fi
-    
-    rm -f "$rsync_output_file" # 清理临时文件
+    rm -f "$rsync_output_file"
 
     if [ $exit_code -eq 0 ]; then
         log "SYNC" "✅ 同步成功: Linux → Windows"
-        ### 新增：记录本次成功的同步方向和时间 ###
         echo "L2W" > "$LAST_SYNC_DIR_FILE"
         date +%s > "$LAST_SYNC_TIME_FILE"
-    elif [ $exit_code -eq 23 ]; then # 部分文件传输错误
-        log "SYNC" "⚠️ 部分文件同步失败 (代码 23): Linux → Windows"
     else
         log "SYNC" "❌ 同步失败 [代码 $exit_code]: Linux → Windows"
     fi
- 
-    release_lock
 }
 
 
+# === sync_win_to_linux (无锁版) ===
 sync_win_to_linux() {
-    if ! acquire_lock "Windows → Linux"; then return; fi
-    
     log "SYNC" "🔄 开始同步: Windows → Linux"
     
-    # 临时文件用于捕获 rsync 的详细输出
-    local rsync_output_file
-    rsync_output_file=$(mktemp /tmp/rsync_win_out.XXXXXX)
+    local rsync_output_file; rsync_output_file=$(mktemp /tmp/rsync_win_out.XXXXXX)
 
-    # ★★★ 关键修改 ★★★
-    # 1. 添加 -i (--itemize-changes) 参数用于详细诊断
-    # 2. 将标准输出和错误都重定向到临时文件
     # shellcheck disable=SC2068
     rsync -avzi --no-owner --no-group --delete \
           -e "ssh -p $SSH_PORT" \
@@ -134,26 +112,22 @@ sync_win_to_linux() {
           "${RSYNC_EXCLUDES[@]}" \
           "$SSH_USER@$SSH_HOST:$WIN_CYGDRIVE_PATH/" \
           "$LINUX_DIR/" > "$rsync_output_file" 2>&1
-
-    # 3. 使用 $? 而不是 ${PIPESTATUS[0]}
     local exit_code=$?
     
-    # 将 rsync 的详细输出打印到主日志文件
     if [ -s "$rsync_output_file" ]; then
-        log "SYNC_DETAIL" "--- rsync 输出 (Win→Lin) ---"
-        # 使用 sed 添加缩进，方便阅读
+       log "SYNC_DETAIL" "--- rsync 输出 (Win→Lin) ---"
         sed 's/^/    /g' "$rsync_output_file" | tee -a "$LOG_FILE"
         log "SYNC_DETAIL" "--- 结束输出 ---"
     fi
-    rm -f "$rsync_output_file" # 清理临时文件
+    rm -f "$rsync_output_file"
     
     if [ $exit_code -eq 0 ]; then
         log "SYNC" "✅ 同步成功: Windows → Linux"
-
-        ### 新增：记录本次成功的同步方向和时间 ###
         echo "W2L" > "$LAST_SYNC_DIR_FILE"
         date +%s > "$LAST_SYNC_TIME_FILE"
-
+        log "PERMS" "🔩 检查并修复权限..."
+        # 简化权限修复调用，如果需要忽略，请恢复之前的逻辑
+        # fix_linux_permissions "$LINUX_DIR"
         # 定义要忽略权限检查的目录路径 (相对于 $LINUX_DIR)
         # 注意：这里的路径是 find 命令能理解的路径
         local ignored_paths=(
@@ -188,14 +162,9 @@ sync_win_to_linux() {
         else
             log "PERMS" "🔩 权限检查通过，无需修复。"
         fi
-    elif [ $exit_code -eq 23 ]; then
-        log "SYNC" "⚠️ 部分文件同步失败 (代码 23): Windows → Linux"
     else
         log "SYNC" "❌ 同步失败 [代码 $exit_code]: Windows → Linux"
     fi
-
-
-    release_lock
 }
 
 
@@ -214,101 +183,81 @@ monitor_linux_changes() {
     done
 }
 
-# ★★★ 关键修正：更健壮的“后沿触发”防抖逻辑 ★★★
+# === debounce_and_sync_linux (负责锁的版本) ===
 debounce_and_sync_linux() {
-    log "INFO" "🚀 [L-SYNC] 防抖同步服务已启动 (后沿触发模式)"
+    log "INFO" "🚀 [L-SYNC] 防抖同步服务已启动"
     while true; do
-        # 1. 等待，直到第一个变化发生（标志文件出现）
         while [ ! -f "$LINUX_CHANGE_FLAG" ]; do
-            sleep 0.5 # 短暂休眠，降低 CPU 占用
+            sleep 0.5
         done
 
-        # 2. 第一个变化已捕获。现在我们等待系统“安静下来”。
-        #    只要在我们的“安静期”（例如 2 秒）内仍有变化，就继续循环。
         log "EVENT" "📢 检测到 Linux 变化，进入 2 秒稳定期..."
-        
         while [ -f "$LINUX_CHANGE_FLAG" ]; do
-            # 将检测到的标志消耗掉
             rm -f "$LINUX_CHANGE_FLAG"
-            # 等待一小段“安静”时间
             sleep 2
-            # 循环会再次检查在这 2 秒内，`monitor_linux_changes` 是否又创建了新的标志文件。
-            # 如果创建了，说明变化仍在继续，循环将继续。
         done
-
-         ### 新增：检查是否需要“同步静默” ###
-        local last_dir=""
-        local last_time=0
-        # 读取上一次同步的状态
+        log "EVENT" "🟢 文件系统已稳定，准备执行 L→W 同步。"
+        
+        # 检查回声
+        local last_dir=""; local last_time=0
         if [ -f "$LAST_SYNC_DIR_FILE" ]; then last_dir=$(cat "$LAST_SYNC_DIR_FILE"); fi
         if [ -f "$LAST_SYNC_TIME_FILE" ]; then last_time=$(cat "$LAST_SYNC_TIME_FILE"); fi
+        local current_time; current_time=$(date +%s)
         
-        local current_time
-        current_time=$(date +%s)
-        
-        # 如果上一次同步是 W→L，并且发生时间在静默期内，则跳过本次同步
         if [[ "$last_dir" == "W2L" && $((current_time - last_time)) -lt $SILENCE_PERIOD ]]; then
-            log "SILENCE" "🔇 [L-SYNC] 忽略 Linux 变化，因为它可能是由最近的 W→L 同步引起的。"
-            continue # 直接进入下一次循环，跳过本次同步
+            log "SILENCE" "🔇 [L-SYNC] 忽略 Linux 变化（回声）。"
+            continue
         fi
 
-        # 3. 如果能跳出上面的 while 循环，说明我们刚刚经历了完整的 2 秒“安静期”，
-        #    文件系统已经稳定。现在是执行同步的最佳时机。
-        log "EVENT" "🟢 文件系统已稳定，执行同步操作。"
-        sync_linux_to_win
+        # 尝试获取锁，如果失败则放弃本次同步，避免竞态条件
+        if acquire_lock "Linux → Windows"; then
+            # 成功获取锁，现在执行同步
+            sync_linux_to_win
+            # 同步完成后，释放锁
+            release_lock
+        else
+            log "ABORT" "❌ [L-SYNC] 放弃同步，因为锁被 W→L 同步占用。"
+        fi
     done
 }
 
-### ★★★ 最终修正版 v3：添加时间戳检查 ★★★
+# === monitor_windows_changes (负责锁的版本) ===
 monitor_windows_changes() {
     log "INFO" "🔍 [W-MON] 开始轮询监控 Windows 目录 (使用 rsync dry-run, 间隔 10s)"
     
     while true; do
-        # -t 参数是检查文件修改的关键！
-        local rsync_args=(
-            -rtin           # ★★★ 关键修正：添加 -t (--times) 参数 ★★★
-            --delete 
-            --no-owner 
-            --no-group
-            -e "ssh -p $SSH_PORT"
-            --rsync-path="$WIN_RSYNC_PATH"
-            "${RSYNC_EXCLUDES[@]}"
-            "$SSH_USER@$SSH_HOST:$WIN_CYGDRIVE_PATH/"
-            "$LINUX_DIR/"
-        )
-
-        local dry_run_output
-        dry_run_output=$(rsync "${rsync_args[@]}" 2>&1)
+        local rsync_args=(-rtin --delete --no-owner --no-group -e "ssh -p $SSH_PORT" --rsync-path="$WIN_RSYNC_PATH" "${RSYNC_EXCLUDES[@]}" "$SSH_USER@$SSH_HOST:$WIN_CYGDRIVE_PATH/" "$LINUX_DIR/")
+        local dry_run_output; dry_run_output=$(rsync "${rsync_args[@]}" 2>&1)
         local exit_code=$?
         
-        # 仅当 rsync 本身执行失败时（如连接中断）才认为是错误
-        if [ $exit_code -ne 0 ]; then
-            if [ $exit_code -eq 24 ]; then
-                log "DEBUG" "[W-MON] rsync dry-run 返回 code 24 (文件在传输中消失)，忽略。"
-            else
-                log "WARN" "⚠️ [W-MON] rsync dry-run 严重失败 [代码 $exit_code]。检查连接或远程路径。"
-                log "WARN" "    - 错误信息: ${dry_run_output}"
-                sleep 30 
-                continue
-            fi
+        if [ $exit_code -ne 0 ] && [ $exit_code -ne 24 ]; then
+            log "WARN" "⚠️ [W-MON] rsync dry-run 失败 [代码 $exit_code]。"
+            log "WARN" "    - 错误信息: ${dry_run_output}"
+            sleep 30; continue
         fi
 
-        # 使用能匹配文件和目录变化的正则表达式
         if echo "$dry_run_output" | grep -q -E '^[.><*c]'; then
             log "EVENT" "📢 [W-MON] 检测到 Windows 目录有变化"
-            log "DEBUG" "[W-MON] Matched changes:"
-            echo "$dry_run_output" | grep -E '^[.><*c]' | while IFS= read -r line; do log "DEBUG" "[W-MON]   - $line"; done
-
-            # 回声抑制逻辑
-            local last_dir="" last_time=0
+            
+            # 检查回声
+            local last_dir=""; local last_time=0
             if [ -f "$LAST_SYNC_DIR_FILE" ]; then last_dir=$(cat "$LAST_SYNC_DIR_FILE"); fi
             if [ -f "$LAST_SYNC_TIME_FILE" ]; then last_time=$(cat "$LAST_SYNC_TIME_FILE"); fi
             local current_time; current_time=$(date +%s)
 
             if [[ "$last_dir" == "L2W" && $((current_time - last_time)) -lt $SILENCE_PERIOD ]]; then
-                log "SILENCE" "🔇 [W-MON] 忽略 Windows 变化 (回声抑制)"
-            else
+                log "SILENCE" "🔇 [W-MON] 忽略 Windows 变化（回声）。"
+                sleep 10; continue
+            fi
+
+            # 尝试获取锁，如果失败则在下个周期重试
+            if acquire_lock "Windows → Linux"; then
+                # 成功获取锁，现在执行同步
                 sync_win_to_linux
+                # 同步完成后，释放锁
+                release_lock
+            else
+                log "INFO" "[W-MON] 锁被 L→W 同步占用，将在下一轮检查时重试。"
             fi
         fi
 
@@ -372,4 +321,3 @@ main() {
 
 # 执行主函数
 main "$@"
-
