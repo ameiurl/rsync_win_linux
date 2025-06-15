@@ -53,6 +53,7 @@ RSYNC_EXCLUDES=(
     "--exclude=node_modules/"
     "--exclude=vendor/"
     "--exclude=runtime/"
+    "--exclude=unpackage/"             # <--- ★★★ 新增规则 ★★★
     # --- 新增规则 ---
     "--exclude=cache/"                 # 1. 排除所有名为 'cache' 的子目录
     "--exclude=/config/database.local.php" # 2. 排除根目录下的特定文件
@@ -75,6 +76,7 @@ INOTIFY_EXCLUDE_PATTERN='(
     node_modules/|
     vendor/|
     runtime/|
+    unpackage/|                        # <--- ★★★ 新增规则 ★★★
     # --- 新增规则 (与 rsync 对应) ---
     cache/|                            # 1. 匹配任何路径下的 'cache/'
     ^config/database\.local\.php$|     # 2. 匹配根目录下精确的文件名 (注意^ $和\.的使用)
