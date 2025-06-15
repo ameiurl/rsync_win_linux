@@ -259,60 +259,60 @@ debounce_and_sync_linux() {
     done
 }
 
+### ★★★ 最终修正版 v3：添加时间戳检查 ★★★
 monitor_windows_changes() {
-    log "INFO" "🔍 [W-MON] 开始轮询监控 Windows 目录: $WIN_DIR (间隔 10s)"
-    local previous_state=""
+    log "INFO" "🔍 [W-MON] 开始轮询监控 Windows 目录 (使用 rsync dry-run, 间隔 10s)"
     
     while true; do
-        # 获取当前文件系统状态快照
-        # 增加了错误处理，如果ssh失败，则循环继续而不是退出
-        local current_state
-        current_state=$(ssh -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" \
-            "powershell -Command \"Get-ChildItem -Recurse -Path '$WIN_DIR' -Exclude @('.git', '.svn', '.idea', '.vscode', 'node_modules', 'vendor', 'runtime', '*.log', '*.tmp', '.env', '*.swp', '~\$*') | Select-Object FullName, LastWriteTime, Length | Sort-Object FullName | ConvertTo-Json -Compress\"" 2>/dev/null)
-        
-        # 如果命令失败或返回空，则跳过本次检查
-        if [ -z "$current_state" ]; then
-            log "WARN" "⚠️ [W-MON] 无法获取 Windows 目录状态 (网络或权限问题?)，15秒后重试。"
-            sleep 15
-            continue
-        fi
-        
-        # 首次运行时初始化状态
-        if [ -z "$previous_state" ]; then
-            previous_state="$current_state"
-            sleep 10 # 初始化的等待时间
-            continue
-        fi
-        
-        # 比较快照
-        if [ "$previous_state" != "$current_state" ]; then
-            log "EVENT" "📢 检测到 Windows 目录状态变化"
+        # -t 参数是检查文件修改的关键！
+        local rsync_args=(
+            -rtin           # ★★★ 关键修正：添加 -t (--times) 参数 ★★★
+            --delete 
+            --no-owner 
+            --no-group
+            -e "ssh -p $SSH_PORT"
+            --rsync-path="$WIN_RSYNC_PATH"
+            "${RSYNC_EXCLUDES[@]}"
+            "$SSH_USER@$SSH_HOST:$WIN_CYGDRIVE_PATH/"
+            "$LINUX_DIR/"
+        )
 
-            ### 新增：检查是否需要“同步静默” ###
-            local last_dir=""
-            local last_time=0
+        local dry_run_output
+        dry_run_output=$(rsync "${rsync_args[@]}" 2>&1)
+        local exit_code=$?
+        
+        # 仅当 rsync 本身执行失败时（如连接中断）才认为是错误
+        if [ $exit_code -ne 0 ]; then
+            if [ $exit_code -eq 24 ]; then
+                log "DEBUG" "[W-MON] rsync dry-run 返回 code 24 (文件在传输中消失)，忽略。"
+            else
+                log "WARN" "⚠️ [W-MON] rsync dry-run 严重失败 [代码 $exit_code]。检查连接或远程路径。"
+                log "WARN" "    - 错误信息: ${dry_run_output}"
+                sleep 30 
+                continue
+            fi
+        fi
+
+        # 使用能匹配文件和目录变化的正则表达式
+        if echo "$dry_run_output" | grep -q -E '^[.><*c]'; then
+            log "EVENT" "📢 [W-MON] 检测到 Windows 目录有变化"
+            log "DEBUG" "[W-MON] Matched changes:"
+            echo "$dry_run_output" | grep -E '^[.><*c]' | while IFS= read -r line; do log "DEBUG" "[W-MON]   - $line"; done
+
+            # 回声抑制逻辑
+            local last_dir="" last_time=0
             if [ -f "$LAST_SYNC_DIR_FILE" ]; then last_dir=$(cat "$LAST_SYNC_DIR_FILE"); fi
             if [ -f "$LAST_SYNC_TIME_FILE" ]; then last_time=$(cat "$LAST_SYNC_TIME_FILE"); fi
-            
-            local current_time
-            current_time=$(date +%s)
+            local current_time; current_time=$(date +%s)
 
-            # 如果上一次同步是 L→W，并且发生时间在静默期内，则跳过本次同步
             if [[ "$last_dir" == "L2W" && $((current_time - last_time)) -lt $SILENCE_PERIOD ]]; then
-                log "SILENCE" "🔇 [W-MON] 忽略 Windows 变化，因为它可能是由最近的 L→W 同步引起的。"
-                # **重要**：即使跳过同步，也要更新状态，否则下次还会因为同样的变化而触发
-                previous_state="$current_state"
-                sleep 10
-                continue # 跳过本次同步
+                log "SILENCE" "🔇 [W-MON] 忽略 Windows 变化 (回声抑制)"
+            else
+                sync_win_to_linux
             fi
-
-            sync_win_to_linux
-            # 同步后立即更新状态，避免重复触发
-            previous_state=$(ssh -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" \
-            "powershell -Command \"Get-ChildItem -Recurse -Path '$WIN_DIR' -Exclude @('.git', '.svn', '.idea', '.vscode', 'node_modules', 'vendor', 'runtime', '*.log', '*.tmp', '.env', '*.swp', '~\$*') | Select-Object FullName, LastWriteTime, Length | Sort-Object FullName | ConvertTo-Json -Compress\"" 2>/dev/null)
         fi
 
-        sleep 10 # 轮询间隔
+        sleep 10
     done
 }
 
