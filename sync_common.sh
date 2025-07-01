@@ -133,7 +133,6 @@ sync_win_to_linux() {
         local ignored_paths=(
             "$LINUX_DIR/.git"
             "$LINUX_DIR/node_modules"
-            "$LINUX_DIR/vendor"
             "$LINUX_DIR/storage/logs"  # 示例：Laravel 的日志目录
             "$LINUX_DIR/bootstrap/cache" # 示例：Laravel 的缓存目录
             "$LINUX_DIR/runtime"

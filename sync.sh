@@ -51,7 +51,6 @@ RSYNC_EXCLUDES=(
     "--exclude=.idea/"
     "--exclude=.vscode/"
     "--exclude=node_modules/"
-    "--exclude=vendor/"
     "--exclude=runtime/"
     "--exclude=unpackage/"             # <--- ★★★ 新增规则 ★★★
     # --- 新增规则 ---
@@ -74,7 +73,6 @@ INOTIFY_EXCLUDE_PATTERN='(
     \.idea/|
     \.vscode/|
     node_modules/|
-    vendor/|
     runtime/|
     unpackage/|                        # <--- ★★★ 新增规则 ★★★
     # --- 新增规则 (与 rsync 对应) ---
