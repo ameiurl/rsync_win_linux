@@ -293,8 +293,8 @@ main() {
     
     # 初始全量同步 (先拉取，再推送，以远程为准或根据需求调整)
     log "INIT" "执行初始同步..."
-    sync_win_to_linux
     sync_linux_to_win
+    sync_win_to_linux
     log "INIT" "✅ 初始同步完成。"
 
     # 启动后台监控进程
