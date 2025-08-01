@@ -196,7 +196,6 @@ sync_linux_to_win() {
 # $1: project_name, $2: linux_dir, $3: win_cygdrive_path, $4: last_sync_dir_file, $5: last_sync_time_file
 sync_win_to_linux() {
     local project_name="$1" linux_dir="$2" win_cygdrive_path="$3" last_sync_dir_file="$4" last_sync_time_file="$5"
-    local skip_perms="$6"
     log "$project_name" "SYNC" "🔄 开始同步: Windows → Linux"
     
     local rsync_output_file; rsync_output_file=$(mktemp "/tmp/rsync_${project_name}_win_out.XXXXXX")
@@ -223,26 +222,26 @@ sync_win_to_linux() {
         date +%s > "$last_sync_time_file"
         
          # --- 新增的条件判断 ---
-        if [[ "$skip_perms" != "true" ]]; then
-            # 权限修复逻辑 (可以根据项目自定义忽略路径)
-            # 示例: 仅为 mallphp 项目添加特殊忽略规则
-            local ignored_paths=()
-            # if [[ "$project_name" == "mallphp" ]]; then
-                ignored_paths=(
-                    "$linux_dir/.git"
-                    "$linux_dir/runtime"
-                )
-            # fi
-            
-            log "$project_name" "PERMS" "🔩 检查并修复权限..."
-            if [ ${#ignored_paths[@]} -gt 0 ]; then
-                fix_linux_permissions "$project_name" "$linux_dir" "${ignored_paths[@]}"
-            else
-                fix_linux_permissions "$project_name" "$linux_dir"
-            fi
-        else
-            log "$project_name" "PERMS" "🔩 跳过权限修复 (初始同步)。"
-        fi
+        # if [[ "$skip_perms" != "true" ]]; then
+        #     # 权限修复逻辑 (可以根据项目自定义忽略路径)
+        #     # 示例: 仅为 mallphp 项目添加特殊忽略规则
+        #     local ignored_paths=()
+        #     # if [[ "$project_name" == "mallphp" ]]; then
+        #         ignored_paths=(
+        #             "$linux_dir/.git"
+        #             "$linux_dir/runtime"
+        #         )
+        #     # fi
+        #
+        #     log "$project_name" "PERMS" "🔩 检查并修复权限..."
+        #     if [ ${#ignored_paths[@]} -gt 0 ]; then
+        #         fix_linux_permissions "$project_name" "$linux_dir" "${ignored_paths[@]}"
+        #     else
+        #         fix_linux_permissions "$project_name" "$linux_dir"
+        #     fi
+        # else
+        #     log "$project_name" "PERMS" "🔩 跳过权限修复 (初始同步)。"
+        # fi
         # --- 条件判断结束 ---
     else
         log "$project_name" "SYNC" "❌ 同步失败 [代码 $exit_code]: Windows → Linux"
@@ -407,7 +406,7 @@ main() {
         # 初始同步 (可选, 可根据需要注释掉)
         log "$project_name" "INIT" "执行初始同步..."
         sync_linux_to_win "$project_name" "$linux_dir" "$win_cygdrive_path" "$last_sync_dir_file" "$last_sync_time_file"
-        sync_win_to_linux "$project_name" "$linux_dir" "$win_cygdrive_path" "$last_sync_dir_file" "$last_sync_time_file" "true"
+        sync_win_to_linux "$project_name" "$linux_dir" "$win_cygdrive_path" "$last_sync_dir_file" "$last_sync_time_file"
         log "$project_name" "INIT" "✅ 初始同步完成。"
 
         # 启动后台监控进程
