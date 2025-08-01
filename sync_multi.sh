@@ -9,7 +9,8 @@ SSH_USER="amei"
 SSH_HOST="192.168.1.3"
 SSH_PORT="22"
 WIN_RSYNC_PATH="\"D:/Program Files (x86)/cwRsync/bin/rsync.exe\"" # 注意引号的使用
-LOG_FILE="/var/log/multi_sync.log"
+# LOG_FILE="/var/log/multi_sync.log"
+LOG_FILE="/home/amei/multi_sync.log"
 PID_FILE="/tmp/multi_sync.pid"
 
 # 同步静默功能: 在一次同步后，忽略反向“回声”变化的秒数
