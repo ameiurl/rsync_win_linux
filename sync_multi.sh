@@ -128,37 +128,6 @@ release_lock() {
     log "$project_name" "LOCK" "锁已释放"
 }
 
-# 权限修复 (已参数化)
-fix_linux_permissions() {
-    local project_name="$1"
-    local target_dir="$2"
-    shift 2 # 移除前两个参数
-    local ignored_paths=("$@")
-
-    log "$project_name" "🔧" "正在为 '$target_dir' 应用权限 (用户: $NORMAL_USER, 组: $NORMAL_GROUP)"
-    if [ ${#ignored_paths[@]} -gt 0 ]; then
-        log "$project_name" "🔧" "    - 忽略以下路径: ${ignored_paths[*]}"
-    fi
-
-    local find_prune_args=()
-    if [ ${#ignored_paths[@]} -gt 0 ]; then
-        find_prune_args+=(-path "${ignored_paths[0]}")
-        for ((i=1; i<${#ignored_paths[@]}; i++)); do
-            find_prune_args+=(-o -path "${ignored_paths[i]}")
-        done
-        find_prune_args=( \( "${find_prune_args[@]}" \) -prune -o )
-    fi
-    
-    local SUDO_CMD=""
-    if [ "$(id -u)" -ne 0 ]; then SUDO_CMD="sudo"; fi
-
-    find "$target_dir" "${find_prune_args[@]}" -exec $SUDO_CMD chown "$NORMAL_USER:$NORMAL_GROUP" {} +
-    find "$target_dir" "${find_prune_args[@]}" -type d -exec $SUDO_CMD chmod 755 {} +
-    find "$target_dir" "${find_prune_args[@]}" -type f -exec $SUDO_CMD chmod 644 {} +
-
-    log "$project_name" "🔩" "权限已应用"
-}
-
 # --- 核心同步函数 (已参数化) ---
 
 # $1: project_name, $2: linux_dir, $3: win_cygdrive_path, $4: last_sync_dir_file, $5: last_sync_time_file
@@ -220,29 +189,6 @@ sync_win_to_linux() {
         log "$project_name" "SYNC" "✅ 同步成功: Windows → Linux"
         echo "W2L" > "$last_sync_dir_file"
         date +%s > "$last_sync_time_file"
-        
-         # --- 新增的条件判断 ---
-        # if [[ "$skip_perms" != "true" ]]; then
-        #     # 权限修复逻辑 (可以根据项目自定义忽略路径)
-        #     # 示例: 仅为 mallphp 项目添加特殊忽略规则
-        #     local ignored_paths=()
-        #     # if [[ "$project_name" == "mallphp" ]]; then
-        #         ignored_paths=(
-        #             "$linux_dir/.git"
-        #             "$linux_dir/runtime"
-        #         )
-        #     # fi
-        #
-        #     log "$project_name" "PERMS" "🔩 检查并修复权限..."
-        #     if [ ${#ignored_paths[@]} -gt 0 ]; then
-        #         fix_linux_permissions "$project_name" "$linux_dir" "${ignored_paths[@]}"
-        #     else
-        #         fix_linux_permissions "$project_name" "$linux_dir"
-        #     fi
-        # else
-        #     log "$project_name" "PERMS" "🔩 跳过权限修复 (初始同步)。"
-        # fi
-        # --- 条件判断结束 ---
     else
         log "$project_name" "SYNC" "❌ 同步失败 [代码 $exit_code]: Windows → Linux"
     fi
