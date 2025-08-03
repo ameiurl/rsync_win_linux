@@ -150,68 +150,58 @@ sync_linux_to_win() {
     fi
 }
 
-#sync_win_to_linux() {
-#    local project_name="$1" linux_dir="$2" win_cygdrive_path="$3"
-#    log "$project_name" "SYNC" "  W→L: 开始将 Windows 变更拉取到 Linux"
-#    
-#    local rsync_output_file; rsync_output_file=$(mktemp "/tmp/rsync_${project_name}_win_out.XXXXXX")
-#
-#    # shellcheck disable=SC2068
-#    rsync -avzi --no-owner --no-group --delete \
-#          -e "ssh -p $SSH_PORT" \
-#          --rsync-path="$WIN_RSYNC_PATH" \
-#          "${RSYNC_EXCLUDES[@]}" \
-#          "$SSH_USER@$SSH_HOST:$win_cygdrive_path/" \
-#          "$linux_dir/" > "$rsync_output_file" 2>&1
-#    local exit_code=$?
-#    
-#    if [ -s "$rsync_output_file" ]; then
-#       log "$project_name" "SYNC_DETAIL" "  --- rsync 输出 (W→L) ---"
-#        sed 's/^/    /g' "$rsync_output_file" | tee -a "$LOG_FILE"
-#        log "$project_name" "SYNC_DETAIL" "  --- 结束输出 ---"
-#    fi
-#    rm -f "$rsync_output_file"
-#    
-#    if [ $exit_code -ne 0 ]; then
-#        log "$project_name" "SYNC" "  ❌ W→L: 拉取失败 [代码 $exit_code]"
-#    fi
-#}
-
 # $1: project_name, $2: linux_dir, $3: win_cygdrive_path
 sync_win_to_linux() {
     local project_name="$1" linux_dir="$2" win_cygdrive_path="$3"
     log "$project_name" "SYNC" "  W→L: 开始将 Windows 变更拉取到 Linux"
     
+    # 创建一个唯一的临时文件来收集两次 rsync 的所有输出
+    local rsync_output_file
+    rsync_output_file=$(mktemp "/tmp/rsync_${project_name}_win_out.XXXXXX")
+    local final_exit_code=0
+
     # --- 步骤 1: 更新已存在的文件，并处理删除 ---
-    # --existing: 只更新在目标（Linux）上已经存在的文件。
-    # -p: 保留这些已存在文件的权限。
-    # --delete: 删除那些在源（Windows）上不存在的文件。
-    # 这一步不会创建任何新文件。
     log "$project_name" "SYNC" "    - 步骤 1/2: 更新和删除已存在的文件..."
+    # 直接将输出追加到临时文件，不经过 sed 处理
     rsync -rtzi --existing --delete \
           -e "ssh -p $SSH_PORT" \
           --rsync-path="$WIN_RSYNC_PATH" \
           "${RSYNC_EXCLUDES[@]}" \
           "$SSH_USER@$SSH_HOST:$win_cygdrive_path/" \
-          "$linux_dir/"
+          "$linux_dir/" >> "$rsync_output_file" 2>&1
+    local exit_code_step1=$?
+    if [ $exit_code_step1 -ne 0 ]; then final_exit_code=$exit_code_step1; fi
 
     # --- 步骤 2: 添加新文件，并设置默认权限 ---
-    # --ignore-existing: 不触摸任何已经存在的文件。
-    # --chmod: 只为这一步创建的新文件和目录设置权限。
-    # -l: 拷贝符号链接。
-    # 注意：这里没有 -p (--perms) 选项，因为我们不关心源的权限。
     log "$project_name" "SYNC" "    - 步骤 2/2: 添加新文件并设置默认权限(D755, F644)..."
+    # 同样直接追加输出
     rsync -rtzl --ignore-existing \
           --chmod=D755,F644 \
           -e "ssh -p $SSH_PORT" \
           --rsync-path="$WIN_RSYNC_PATH" \
           "${RSYNC_EXCLUDES[@]}" \
           "$SSH_USER@$SSH_HOST:$win_cygdrive_path/" \
-          "$linux_dir/"
+          "$linux_dir/" >> "$rsync_output_file" 2>&1
+    local exit_code_step2=$?
+    if [ $exit_code_step2 -ne 0 ]; then final_exit_code=$exit_code_step2; fi
+
+    # --- 日志处理 ---
+    # 如果临时文件里有任何内容，就把它格式化并打印到主日志
+    if [ -s "$rsync_output_file" ]; then
+       log "$project_name" "SYNC_DETAIL" "  --- rsync 综合输出 (W→L) ---"
+        # 使用 sed 添加缩进，并用 tee 同时输出到屏幕和主日志文件
+        sed 's/^/    /g' "$rsync_output_file" | tee -a "$LOG_FILE"
+        log "$project_name" "SYNC_DETAIL" "  --- 结束输出 ---"
+    fi
+    # 清理临时文件
+    rm -f "$rsync_output_file"
     
-    # 由于我们分成了两步，统一在这里记录一个成功/失败信息
-    # 这里的 exit_code 判断可以简化或移除，因为主要错误会在 rsync 执行时显示
-    log "$project_name" "SYNC" "  ✅ W→L: 拉取完成。"
+    # --- 最终状态报告 ---
+    if [ $final_exit_code -eq 0 ]; then
+        log "$project_name" "SYNC" "  ✅ W→L: 拉取完成。"
+    else
+        log "$project_name" "SYNC" "  ❌ W→L: 拉取过程中发生错误 [代码 $final_exit_code]"
+    fi
 }
 
 reconcile_and_sync() {
