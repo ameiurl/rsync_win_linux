@@ -218,28 +218,47 @@ debounce_and_sync_linux() {
     while true; do
         while [ ! -f "$change_flag_file" ]; do sleep 0.5; done
 
-        log "$project_name" "EVENT" "📢 检测到 Linux 变化，进入 2 秒稳定期..."
-        while [ -f "$change_flag_file" ]; do
-            rm -f "$change_flag_file"
-            sleep 2
-        done
-        log "$project_name" "EVENT" "🟢 文件系统已稳定，准备执行 L→W 同步。"
+        log "$project_name" "EVENT" "📢 检测到 Linux 变化，准备处理..."
         
-        local last_dir=""; local last_time=0
-        if [ -f "$last_sync_dir_file" ]; then last_dir=$(cat "$last_sync_dir_file"); fi
-        if [ -f "$last_sync_time_file" ]; then last_time=$(cat "$last_sync_time_file"); fi
-        local current_time; current_time=$(date +%s)
-        
-        if [[ "$last_dir" == "W2L" && $((current_time - last_time)) -lt $SILENCE_PERIOD ]]; then
-            log "$project_name" "SILENCE" "🔇 [L-SYNC] 忽略 Linux 变化（回声）。"
-            continue
-        fi
-
         if acquire_lock "$project_name" "$lock_file" "Linux → Windows"; then
+            log "$project_name" "EVENT" "🟢 已获取锁，进入 2 秒稳定期..."
+            while [ -f "$change_flag_file" ]; do
+                rm -f "$change_flag_file"
+                sleep 2
+            done
+            log "$project_name" "EVENT" "🟢 文件系统已稳定。"
+
+            # 【最终优化决策链】
+            # 1. 首先，进行廉价的回声检查。
+            local last_dir=""; local last_time=0
+            if [ -f "$last_sync_dir_file" ]; then last_dir=$(cat "$last_sync_dir_file"); fi
+            if [ -f "$last_sync_time_file" ]; then last_time=$(cat "$last_sync_time_file"); fi
+            local current_time; current_time=$(date +%s)
+
+            if [[ "$last_dir" == "W2L" && $((current_time - last_time)) -lt $SILENCE_PERIOD ]]; then
+                # 2. 如果是回声，我们不能像以前一样直接放弃。
+                #    我们需要用 dry-run 做最终确认，以防用户在回声期间做出了真正的修改。
+                log "$project_name" "SILENCE" "🔇 [L-SYNC] 检测到潜在回声，执行 dry-run 进行最终确认..."
+                local rsync_args=(-rtin --delete --no-owner --no-group -e "ssh -p $SSH_PORT" --rsync-path="$WIN_RSYNC_PATH" "${RSYNC_EXCLUDES[@]}" "$linux_dir/" "$SSH_USER@$SSH_HOST:$win_cygdrive_path/")
+                local dry_run_output
+                dry_run_output=$(rsync "${rsync_args[@]}" 2>&1)
+
+                if ! echo "$dry_run_output" | grep -q -E '^[.><*c]'; then
+                    # dry-run 确认没有差异，这确实只是个回声，可以安全地忽略。
+                    log "$project_name" "SILENCE" "🔇 [L-SYNC] dry-run 确认无差异，忽略回声。"
+                    release_lock "$project_name" "$lock_file"
+                    continue
+                fi
+                # 如果 dry-run 发现了差异，说明在回声期间有新的、真正的修改，必须同步！
+                log "$project_name" "EVENT" "📢 [L-SYNC] dry-run 在回声期内发现真实修改，继续同步！"
+            fi
+            
+            # 3. 如果不是回声，或者回声期间有真实修改，则执行同步。
             sync_linux_to_win "$project_name" "$linux_dir" "$win_cygdrive_path" "$last_sync_dir_file" "$last_sync_time_file"
+            
             release_lock "$project_name" "$lock_file"
         else
-            log "$project_name" "ABORT" "❌ [L-SYNC] 放弃同步，因为锁被 W→L 同步占用。"
+            log "$project_name" "ABORT" "❌ [L-SYNC] 无法获取锁。"
         fi
     done
 }
@@ -252,37 +271,45 @@ monitor_windows_changes() {
     log "$project_name" "W-MON" "🔍 开始轮询监控 Windows 目录 (间隔 10s)"
     
     while true; do
-        local rsync_args=(-rtin --delete --no-owner --no-group -e "ssh -p $SSH_PORT" --rsync-path="$WIN_RSYNC_PATH" "${RSYNC_EXCLUDES[@]}" "$SSH_USER@$SSH_HOST:$win_cygdrive_path/" "$linux_dir/")
-        local dry_run_output; dry_run_output=$(rsync "${rsync_args[@]}" 2>&1)
+        sleep 10
+        
+        local external_rsync_args=(-rtin --delete --no-owner --no-group -e "ssh -p $SSH_PORT" --rsync-path="$WIN_RSYNC_PATH" "${RSYNC_EXCLUDES[@]}" "$SSH_USER@$SSH_HOST:$win_cygdrive_path/" "$linux_dir/")
+        local external_dry_run_output
+        external_dry_run_output=$(rsync "${external_rsync_args[@]}" 2>&1)
         local exit_code=$?
         
         if [ $exit_code -ne 0 ] && [ $exit_code -ne 24 ]; then
             log "$project_name" "WARN" "⚠️ [W-MON] rsync dry-run 失败 [代码 $exit_code]。"
-            log "$project_name" "WARN" "    - 错误信息: ${dry_run_output}"
-            sleep 30; continue
+            log "$project_name" "WARN" "    - 错误信息: ${external_dry_run_output}"
+            sleep 20; continue
         fi
 
-        if echo "$dry_run_output" | grep -q -E '^[.><*c]'; then
-            log "$project_name" "EVENT" "📢 [W-MON] 检测到 Windows 目录有变化"
+        if echo "$external_dry_run_output" | grep -q -E '^[.><*c]'; then
+            log "$project_name" "EVENT" "📢 [W-MON] 初步检测到 Windows 目录有变化"
             
-            local last_dir=""; local last_time=0
-            if [ -f "$last_sync_dir_file" ]; then last_dir=$(cat "$last_sync_dir_file"); fi
-            if [ -f "$last_sync_time_file" ]; then last_time=$(cat "$last_sync_time_file"); fi
-            local current_time; current_time=$(date +%s)
-
-            if [[ "$last_dir" == "L2W" && $((current_time - last_time)) -lt $SILENCE_PERIOD ]]; then
-                log "$project_name" "SILENCE" "🔇 [W-MON] 忽略 Windows 变化（回声）。"
-                sleep 10; continue
-            fi
-
             if acquire_lock "$project_name" "$lock_file" "Windows → Linux"; then
-                sync_win_to_linux "$project_name" "$linux_dir" "$win_cygdrive_path" "$last_sync_dir_file" "$last_sync_time_file"
+                
+                # 【终极修正】在锁内，再做一次 dry-run 作为最终裁决。
+                # 这可以防止因 L-SYNC 刚刚同步完成，而本进程因时间戳精度问题误判的情况。
+                log "$project_name" "INFO" "[W-MON] 已获取锁，执行最终 dry-run 确认..."
+                local internal_rsync_args=(-rtin --delete --no-owner --no-group -e "ssh -p $SSH_PORT" --rsync-path="$WIN_RSYNC_PATH" "${RSYNC_EXCLUDES[@]}" "$SSH_USER@$SSH_HOST:$win_cygdrive_path/" "$linux_dir/")
+                local internal_dry_run_output
+                internal_dry_run_output=$(rsync "${internal_rsync_args[@]}" 2>&1)
+
+                if echo "$internal_dry_run_output" | grep -q -E '^[.><*c]'; then
+                    # 只有在锁内再次确认仍有差异时，才执行同步。
+                    log "$project_name" "INFO" "[W-MON] 最终确认存在差异，执行同步。"
+                    sync_win_to_linux "$project_name" "$linux_dir" "$win_cygdrive_path" "$last_sync_dir_file" "$last_sync_time_file"
+                else
+                    # 锁内确认无差异，说明是时间戳精度等引起的回声误报。
+                    log "$project_name" "SILENCE" "🔇 [W-MON] 最终确认无实际差异，忽略本次触发。"
+                fi
+                
                 release_lock "$project_name" "$lock_file"
             else
                 log "$project_name" "INFO" "[W-MON] 锁被 L→W 同步占用，将在下一轮检查时重试。"
             fi
         fi
-        sleep 10
     done
 }
 
