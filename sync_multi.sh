@@ -49,11 +49,15 @@ INOTIFY_EXCLUDE_PATTERN='(\.git/|\.svn/|\.idea/|\.vscode/|node_modules/|runtime/
 INOTIFY_EXCLUDE_PATTERN=$(echo "$INOTIFY_EXCLUDE_PATTERN" | tr -d ' \n')
 
 # --- 工具函数 ---
-# 日志函数保持不变
 log() {
     local project_name="$1"
     local level="$2"
     local message="$3"
+    
+    # BASHPID 能准确反映当前子进程的ID
+    local pid="$BASHPID"
+
+    # 颜色和符号定义
     local C_RESET='\033[0m'; local C_CYAN='\033[0;36m'; local C_GREEN='\033[0;32m'; local C_YELLOW='\033[0;33m'; local C_RED='\033[0;31m'; local C_BLUE='\033[0;34m'; local C_GRAY='\033[0;90m'
     local color=""; local symbol=""
     case "$level" in
@@ -66,14 +70,19 @@ log() {
         "L-MON")    color="$C_GRAY";   symbol="🐧" ;;
         "W-MON")    color="$C_GRAY";   symbol="🪟" ;;
         "ERROR")    color="$C_RED";    symbol="❌" ;;
+        "MAIN")     color="$C_GREEN";  symbol="🎬" ;; # 为主进程增加一个符号
         *)          color="$C_RESET";  symbol="➡️" ;;
     esac
+
+    # 对 SYNC_DETAIL 特殊处理，增加缩进
     if [[ "$level" == "SYNC_DETAIL" ]]; then
         echo -e "    $message" | tee -a "$LOG_FILE"
     else
-        echo -e "[$(date '+%Y-%m-%d %H:%M:%S')] ${C_GREEN}[$project_name]${C_RESET} ${color}${symbol} $message${C_RESET}" | tee -a "$LOG_FILE"
+        # 在日志中加入 BASHPID
+        echo -e "[$(date '+%Y-%m-%d %H:%M:%S')] [PID:$pid] ${C_GREEN}[$project_name]${C_RESET} ${color}${symbol} $message${C_RESET}" | tee -a "$LOG_FILE"
     fi
 }
+
 # 锁函数保持不变
 acquire_lock() {
     local project_name="$1"
