@@ -19,21 +19,30 @@ NORMAL_GROUP="amei"
 
 # --- 项目配置 (关键改动) ---
 PROJECT_NAMES=(
-    "mallphp"
-    "adminvue"
-    "chidian_store_uniapp"
+    # "mallphp"
+    # "adminvue"
+    # "chidian_store_uniapp"
+    "jgyc2023_com_cn"
+    "chidian_store_uniapp2"
+    "chidian_admin_frontend"
 )
 
 LINUX_DIRS=(
-    "/server/www/mallphp"
-    "/server/www/adminvue"
-    "/server/www/chidian_store_uniapp"
+    # "/server/www/mallphp"
+    # "/server/www/adminvue"
+    # "/server/www/chidian_store_uniapp"
+    "/server/www/jgyc2023_com_cn"
+    "/server/www/chidian_store_uniapp2"
+    "/server/www/chidian_admin_frontend"
 )
 
 WIN_DIRS=(
-    "D:\\www\\mallphp"   # PowerShell/Windows 路径
-    "D:\\www\\adminvue"
-    "D:\\www\\chidian_store_uniapp"
+    # "D:\\www\\mallphp"   # PowerShell/Windows 路径
+    # "D:\\www\\adminvue"
+    # "D:\\www\\chidian_store_uniapp"
+    "D:\\www\\jgyc2023_com_cn"
+    "D:\\www\\chidian_store_uniapp2"
+    "D:\\www\\chidian_admin_frontend"
 )
 
 # --- 全局排除列表 (所有项目共享) ---
@@ -119,7 +128,7 @@ sync_linux_to_win() {
     local project_name="$1" linux_dir="$2" win_cygdrive_path="$3"
     log "$project_name" "SYNC" "L→W: 推送 Linux 变更..."
     local rsync_output_file; rsync_output_file=$(mktemp "/tmp/rsync_${project_name}_linux_out.XXXXXX")
-    rsync -avzi --no-owner --no-group --delete \
+    rsync -avzi --no-owner --no-group --delete --modify-window=2 \
           -e "ssh -p $SSH_PORT" --rsync-path="$WIN_RSYNC_PATH" \
           "${RSYNC_EXCLUDES[@]}" "$linux_dir/" "$SSH_USER@$SSH_HOST:$win_cygdrive_path/" > "$rsync_output_file" 2>&1
     local exit_code=$?
@@ -141,7 +150,7 @@ sync_win_to_linux() {
     local rsync_output_file; rsync_output_file=$(mktemp "/tmp/rsync_${project_name}_win_out.XXXXXX")
     local final_exit_code=0
     # 步骤 1: 更新和删除
-    rsync -rtzi --existing --delete \
+    rsync -rtzi --existing --delete --modify-window=2 \
           -e "ssh -p $SSH_PORT" --rsync-path="$WIN_RSYNC_PATH" \
           "${RSYNC_EXCLUDES[@]}" "$SSH_USER@$SSH_HOST:$win_cygdrive_path/" "$linux_dir/" >> "$rsync_output_file" 2>&1
     local exit_code_step1=$?
