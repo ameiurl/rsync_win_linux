@@ -1,17 +1,17 @@
 #!/bin/bash
 # 权限修复与防抖增强版 - 多项目双向实时监控同步脚本
 # 作者: AMEI (基于原版修改)
-# 版本: 3.3 (最终日志版)
-# 功能: 支持同时监控和同步多个独立的目录对，并正确处理交叉变更。
+# 版本: 4.0 (防回退修复版)
+# 功能: 支持同时监控和同步多个独立的目录对，避免修改回退问题。
 
 # --- 全局配置 (所有项目共享) ---
 SSH_USER="amei"
 SSH_HOST="192.168.1.3"
 SSH_PORT="22"
 WIN_RSYNC_PATH="\"D:/Program Files (x86)/cwRsync/bin/rsync.exe\"" # 注意引号的使用
-# LOG_FILE="/var/log/multi_sync.log"
 LOG_FILE="/home/amei/multi_sync.log"
 PID_FILE="/tmp/multi_sync.pid"
+STATE_DIR="/tmp/sync_state"  # 新增：状态目录
 
 # 权限修复相关
 NORMAL_USER="amei"
@@ -67,7 +67,7 @@ log() {
     local pid="$BASHPID"
 
     # 颜色和符号定义
-    local C_RESET='\033[0m'; local C_CYAN='\033[0;36m'; local C_GREEN='\033[0;32m'; local C_YELLOW='\033[0;33m'; local C_RED='\033[0;31m'; local C_BLUE='\033[0;34m'; local C_GRAY='\033[0;90m'
+    local C_RESET='\033[0m'; local C_CYAN='\033[0;36m'; local C_GREEN='\033[0;32m'; local C_YELLOW='\033[0;33m'; local C_RED='\033[0;31m'; local C_BLUE='\033[0;34m'; local C_GRAY='\033[0;90m'; local C_MAGENTA='\033[0;35m'
     local color=""; local symbol=""
     case "$level" in
         "EVENT")    color="$C_CYAN";   symbol="📢" ;;
@@ -79,7 +79,9 @@ log() {
         "L-MON")    color="$C_GRAY";   symbol="🐧" ;;
         "W-MON")    color="$C_GRAY";   symbol="🪟" ;;
         "ERROR")    color="$C_RED";    symbol="❌" ;;
-        "MAIN")     color="$C_GREEN";  symbol="🎬" ;; # 为主进程增加一个符号
+        "MAIN")     color="$C_GREEN";  symbol="🎬" ;;
+        "SKIP")     color="$C_MAGENTA";symbol="⏭️" ;;  # 新增
+        "DEBUG")    color="$C_GRAY";   symbol="🔧" ;;  # 新增
         *)          color="$C_RESET";  symbol="➡️" ;;
     esac
 
@@ -90,6 +92,53 @@ log() {
         # 在日志中加入 BASHPID
         echo -e "[$(date '+%Y-%m-%d %H:%M:%S')] [PID:$pid] ${C_GREEN}[$project_name]${C_RESET} ${color}${symbol} $message${C_RESET}" | tee -a "$LOG_FILE"
     fi
+}
+
+# 确保状态目录存在
+ensure_state_dir() {
+    mkdir -p "$STATE_DIR"
+    for project_name in "${PROJECT_NAMES[@]}"; do
+        mkdir -p "$STATE_DIR/$project_name"
+    done
+}
+
+# 记录同步操作（防回环）
+record_sync() {
+    local project_name="$1"
+    local direction="$2"  # "L2W" 或 "W2L"
+    local state_file="$STATE_DIR/$project_name/last_sync"
+    echo "$(date +%s):$direction" > "$state_file"
+}
+
+# 检查是否刚刚同步过（避免回环）
+should_skip_sync() {
+    local project_name="$1"
+    local direction="$2"
+    local state_file="$STATE_DIR/$project_name/last_sync"
+    
+    if [ ! -f "$state_file" ]; then
+        return 1  # 不跳过
+    fi
+    
+    local last_sync_info
+    last_sync_info=$(cat "$state_file")
+    local last_sync_time="${last_sync_info%%:*}"
+    local last_sync_dir="${last_sync_info##*:}"
+    local current_time
+    current_time=$(date +%s)
+    local time_diff=$((current_time - last_sync_time))
+    
+    # 如果10秒内刚做过反向同步，则跳过
+    if [ "$direction" == "W2L" ] && [ "$last_sync_dir" == "L2W" ] && [ $time_diff -lt 10 ]; then
+        log "$project_name" "SKIP" "跳过 W→L 同步（${time_diff}秒前刚执行过 L→W）"
+        return 0  # 跳过
+    fi
+    if [ "$direction" == "L2W" ] && [ "$last_sync_dir" == "W2L" ] && [ $time_diff -lt 10 ]; then
+        log "$project_name" "SKIP" "跳过 L→W 同步（${time_diff}秒前刚执行过 W→L）"
+        return 0  # 跳过
+    fi
+    
+    return 1  # 不跳过
 }
 
 # 锁函数保持不变
@@ -115,6 +164,7 @@ acquire_lock() {
         return 0
     fi
 }
+
 release_lock() {
     local project_name="$1"
     local lock_file="$2"
@@ -122,66 +172,117 @@ release_lock() {
     log "$project_name" "LOCK" "锁已释放"
 }
 
-
-# --- 核心同步函数 (已参数化) ---
+# --- 核心同步函数（修复版）---
 sync_linux_to_win() {
     local project_name="$1" linux_dir="$2" win_cygdrive_path="$3"
+    
+    # 检查防回环
+    if should_skip_sync "$project_name" "L2W"; then
+        return 0
+    fi
+    
     log "$project_name" "SYNC" "L→W: 推送 Linux 变更..."
     local rsync_output_file; rsync_output_file=$(mktemp "/tmp/rsync_${project_name}_linux_out.XXXXXX")
-    rsync -avzi --no-owner --no-group --delete --modify-window=2 \
+    
+    # 使用 --update 参数，只同步更新的文件
+    rsync -avzi --update --no-owner --no-group --delete --modify-window=2 \
           -e "ssh -p $SSH_PORT" --rsync-path="$WIN_RSYNC_PATH" \
           "${RSYNC_EXCLUDES[@]}" "$linux_dir/" "$SSH_USER@$SSH_HOST:$win_cygdrive_path/" > "$rsync_output_file" 2>&1
     local exit_code=$?
+    
     if [ -s "$rsync_output_file" ]; then
         log "$project_name" "SYNC_DETAIL" "--- rsync 输出 (L→W) ---"
         sed 's/^/    /g' "$rsync_output_file" | tee -a "$LOG_FILE" > /dev/null
         log "$project_name" "SYNC_DETAIL" "--- 结束输出 ---"
     fi
+    
     rm -f "$rsync_output_file"
-    if [ $exit_code -ne 0 ]; then
+    
+    if [ $exit_code -eq 0 ] || [ $exit_code -eq 24 ]; then
+        record_sync "$project_name" "L2W"
+        log "$project_name" "INFO" "L→W 同步完成"
+    else
         log "$project_name" "ERROR" "L→W 推送失败 [代码 $exit_code]"
     fi
 }
 
-# 【日志优化】移除内部子步骤日志
 sync_win_to_linux() {
     local project_name="$1" linux_dir="$2" win_cygdrive_path="$3"
+    
+    # 检查防回环
+    if should_skip_sync "$project_name" "W2L"; then
+        return 0
+    fi
+    
     log "$project_name" "SYNC" "W→L: 拉取 Windows 变更..."
     local rsync_output_file; rsync_output_file=$(mktemp "/tmp/rsync_${project_name}_win_out.XXXXXX")
     local final_exit_code=0
-    # 步骤 1: 更新和删除
-    rsync -rtzi --existing --delete --modify-window=2 \
+    
+    # 步骤 1: 同步目录结构（包括空目录）
+    rsync -d --recursive --no-owner --no-group --chmod=D755 --modify-window=2 \
+          -e "ssh -p $SSH_PORT" --rsync-path="$WIN_RSYNC_PATH" \
+          "${RSYNC_EXCLUDES[@]}" "$SSH_USER@$SSH_HOST:$win_cygdrive_path/" "$linux_dir/" > "$rsync_output_file" 2>&1
+    
+    # 步骤 2: 更新已存在文件（保护权限，使用 --update）
+    rsync -rtzi --update --existing --no-owner --no-group --no-perms --modify-window=2 \
           -e "ssh -p $SSH_PORT" --rsync-path="$WIN_RSYNC_PATH" \
           "${RSYNC_EXCLUDES[@]}" "$SSH_USER@$SSH_HOST:$win_cygdrive_path/" "$linux_dir/" >> "$rsync_output_file" 2>&1
     local exit_code_step1=$?
-    if [ $exit_code_step1 -ne 0 ]; then final_exit_code=$exit_code_step1; fi
-    # 步骤 2: 新增
-    rsync -rtzl --ignore-existing --chmod=D755,F644 \
+    if [ $exit_code_step1 -ne 0 ] && [ $exit_code_step1 -ne 24 ]; then 
+        final_exit_code=$exit_code_step1
+    fi
+    
+    # 步骤 3: 新增文件（设置权限）
+    rsync -rtzl --ignore-existing --chmod=D755,F644 --modify-window=2 \
           -e "ssh -p $SSH_PORT" --rsync-path="$WIN_RSYNC_PATH" \
           "${RSYNC_EXCLUDES[@]}" "$SSH_USER@$SSH_HOST:$win_cygdrive_path/" "$linux_dir/" >> "$rsync_output_file" 2>&1
     local exit_code_step2=$?
-    if [ $exit_code_step2 -ne 0 ]; then final_exit_code=$exit_code_step2; fi
+    if [ $exit_code_step2 -ne 0 ] && [ $exit_code_step2 -ne 24 ]; then 
+        final_exit_code=$exit_code_step2
+    fi
+    
+    # 步骤 4: 删除多余文件
+    rsync -rd --delete --existing --ignore-non-existing --no-owner --no-group --no-perms --modify-window=2 \
+          -e "ssh -p $SSH_PORT" --rsync-path="$WIN_RSYNC_PATH" \
+          "${RSYNC_EXCLUDES[@]}" "$SSH_USER@$SSH_HOST:$win_cygdrive_path/" "$linux_dir/" >> "$rsync_output_file" 2>&1
+    local exit_code_step3=$?
+    if [ $exit_code_step3 -ne 0 ] && [ $exit_code_step3 -ne 24 ]; then 
+        final_exit_code=$exit_code_step3
+    fi
+    
     # 日志处理
     if [ -s "$rsync_output_file" ]; then
         log "$project_name" "SYNC_DETAIL" "--- rsync 综合输出 (W→L) ---"
         sed 's/^/    /g' "$rsync_output_file" | tee -a "$LOG_FILE" > /dev/null
         log "$project_name" "SYNC_DETAIL" "--- 结束输出 ---"
     fi
+    
     rm -f "$rsync_output_file"
-    if [ $final_exit_code -ne 0 ]; then
+    
+    if [ $final_exit_code -eq 0 ] || [ $final_exit_code -eq 24 ]; then
+        record_sync "$project_name" "W2L"
+        log "$project_name" "INFO" "W→L 同步完成"
+    else
         log "$project_name" "ERROR" "W→L 拉取过程中发生错误 [代码 $final_exit_code]"
     fi
 }
 
-# 【日志优化】移除内部子步骤日志
+# 【修复】改为单向同步，避免回退
 reconcile_and_sync() {
     local project_name="$1" linux_dir="$2" win_cygdrive_path="$3" trigger_source="$4"
+    
     if [[ "$trigger_source" == "linux" ]]; then
+        # Linux变化时，只推送到Windows
         sync_linux_to_win "$project_name" "$linux_dir" "$win_cygdrive_path"
+    elif [[ "$trigger_source" == "windows" ]]; then
+        # Windows变化时，只拉取到Linux
         sync_win_to_linux "$project_name" "$linux_dir" "$win_cygdrive_path"
-    else 
-        sync_win_to_linux "$project_name" "$linux_dir" "$win_cygdrive_path"
+    else
+        # 启动时执行双向同步，但有间隔
+        log "$project_name" "INIT" "执行初始化双向同步..."
         sync_linux_to_win "$project_name" "$linux_dir" "$win_cygdrive_path"
+        sleep 3  # 等待3秒
+        sync_win_to_linux "$project_name" "$linux_dir" "$win_cygdrive_path"
     fi
 }
 
@@ -189,30 +290,33 @@ reconcile_and_sync() {
 monitor_linux_changes() {
     local project_name="$1" linux_dir="$2" change_flag_file="$3"
     log "$project_name" "L-MON" "开始监控 Linux: $linux_dir"
-    inotifywait -m -r -q -e create,delete,modify,move \
+    inotifywait -m -r -q -e create,delete,modify,move,close_write \
                 --excludei "$INOTIFY_EXCLUDE_PATTERN" \
                 "$linux_dir" |
     while read -r path action file; do
+        # 过滤掉属性变化事件
+        if [[ "$action" =~ "ATTRIB" ]]; then
+            continue
+        fi
         touch "$change_flag_file"
     done
 }
 
-# 【日志优化】将空行分隔符移到 acquire_lock 成功之后
 debounce_and_sync_linux() {
     local project_name="$1" linux_dir="$2" win_cygdrive_path="$3" \
           lock_file="$4" change_flag_file="$5"
           
-    log "$project_name" "L-SYNC" "防抖和解服务已启动。"
+    log "$project_name" "L-SYNC" "防抖服务已启动。"
     while true; do
         while [ ! -f "$change_flag_file" ]; do sleep 0.5; done
 
-        echo | tee -a "$LOG_FILE" # 在事件处理开始时打印空行
+        echo | tee -a "$LOG_FILE"
         log "$project_name" "EVENT" "检测到 Linux 变化，准备处理..."
-        if acquire_lock "$project_name" "$lock_file" "Reconciliation from Linux"; then
-            log "$project_name" "INFO" "已获取锁，进入 2 秒稳定期..."
+        if acquire_lock "$project_name" "$lock_file" "Sync from Linux"; then
+            log "$project_name" "INFO" "已获取锁，进入 3 秒稳定期..."
             while [ -f "$change_flag_file" ]; do
                 rm -f "$change_flag_file"
-                sleep 2
+                sleep 3  # 增加到3秒
             done
             log "$project_name" "INFO" "文件系统已稳定。"
             reconcile_and_sync "$project_name" "$linux_dir" "$win_cygdrive_path" "linux"
@@ -221,7 +325,6 @@ debounce_and_sync_linux() {
     done
 }
 
-# 【日志优化】将空行分隔符移到 acquire_lock 成功之后
 monitor_windows_changes() {
     local project_name="$1" linux_dir="$2" win_cygdrive_path="$3" \
           lock_file="$4"
@@ -229,19 +332,24 @@ monitor_windows_changes() {
     log "$project_name" "W-MON" "开始轮询 Windows (间隔 10s)..."
     while true; do
         sleep 10
-        local rsync_args=(-rtin --delete --no-owner --no-group -e "ssh -p $SSH_PORT" --rsync-path="$WIN_RSYNC_PATH" "${RSYNC_EXCLUDES[@]}" "$SSH_USER@$SSH_HOST:$win_cygdrive_path/" "$linux_dir/")
+        # 使用 --update 参数进行dry-run
+        local rsync_args=(-rtin --update --delete --no-owner --no-group --no-perms --modify-window=2 \
+                         -e "ssh -p $SSH_PORT" --rsync-path="$WIN_RSYNC_PATH" \
+                         "${RSYNC_EXCLUDES[@]}" "$SSH_USER@$SSH_HOST:$win_cygdrive_path/" "$linux_dir/")
         local dry_run_output
         dry_run_output=$(rsync "${rsync_args[@]}" 2>&1)
         local exit_code=$?
+        
         if [ $exit_code -ne 0 ] && [ $exit_code -ne 24 ]; then
             log "$project_name" "ERROR" "W-MON rsync dry-run 失败 [代码 $exit_code]。"
-            log "$project_name" "INFO" "错误信息: ${dry_run_output}"
             sleep 20; continue
         fi
-        if echo "$dry_run_output" | grep -q -E '^[.><*c]'; then
-            echo | tee -a "$LOG_FILE" # 在事件处理开始时打印空行
+        
+        # 检测变化（包括新目录）
+        if echo "$dry_run_output" | grep -q -E '^[.><*c]|^cd\+\+\+\+\+\+\+\+\+'; then
+            echo | tee -a "$LOG_FILE"
             log "$project_name" "EVENT" "检测到 Windows 目录有变化"
-            if acquire_lock "$project_name" "$lock_file" "Reconciliation from Windows"; then
+            if acquire_lock "$project_name" "$lock_file" "Sync from Windows"; then
                 reconcile_and_sync "$project_name" "$linux_dir" "$win_cygdrive_path" "windows"
                 release_lock "$project_name" "$lock_file"
             fi
@@ -257,6 +365,10 @@ main() {
         exit 1
     fi
     echo $$ > "$PID_FILE"
+    
+    # 确保状态目录存在
+    ensure_state_dir
+    
     # 清理函数
     cleanup() {
         echo -e "\n\033[0;33m🛑 接收到信号，正在清理并退出...\033[0m"
@@ -264,25 +376,30 @@ main() {
         for project_name in "${PROJECT_NAMES[@]}"; do
             rm -f "/tmp/rsync_${project_name}.lock" "/tmp/${project_name}_change.flag"
         done
+        rm -rf "$STATE_DIR"
         if [ ${#ALL_PIDS[@]} -gt 0 ]; then
             echo -e "\033[0;33mℹ️  正在停止所有子进程: ${ALL_PIDS[*]}\033[0m"
-            kill "${ALL_PIDS[@]}"
+            kill "${ALL_PIDS[@]}" 2>/dev/null
+            sleep 1
+            kill -9 "${ALL_PIDS[@]}" 2>/dev/null
         fi
         echo -e "\033[0;32m👋 脚本已停止。\033[0m"
         exit 0
     }
     trap cleanup SIGINT SIGTERM
+    
     # 脚本启动日志
     echo | tee -a "$LOG_FILE"
     log "MAIN" "INIT" "================== 脚本启动 (PID: $$) =================="
     mkdir -p "$(dirname "$LOG_FILE")"
     touch "$LOG_FILE" || { echo "错误：无法创建或写入日志文件 $LOG_FILE"; exit 1; }
+    
     # 遍历并启动每个项目的监控
     for i in "${!PROJECT_NAMES[@]}"; do
         local project_name="${PROJECT_NAMES[i]}"
         local linux_dir="${LINUX_DIRS[i]}"
         local win_dir="${WIN_DIRS[i]}"
-        local win_cygdrive_path="/cygdrive/$(echo "$win_dir" | sed 's/\\/\//g' | sed 's/://')"
+        local win_cygdrive_path="/cygdrive/$(echo "$win_dir" | sed 's/\\/\//g' | sed 's/://' | tr '[:upper:]' '[:lower:]')"
         local lock_file="/tmp/rsync_${project_name}.lock"
         local change_flag_file="/tmp/${project_name}_change.flag"
         
@@ -300,6 +417,7 @@ main() {
         monitor_windows_changes "$project_name" "$linux_dir" "$win_cygdrive_path" "$lock_file" &
         ALL_PIDS+=($!)
     done
+    
     echo | tee -a "$LOG_FILE"
     log "MAIN" "INIT" "所有项目的监控进程已启动。"
     log "MAIN" "INFO" "所有子进程 PIDs: ${ALL_PIDS[*]}"
