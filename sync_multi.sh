@@ -1,8 +1,8 @@
 #!/bin/bash
 # 权限修复与防抖增强版 - 多项目双向实时监控同步脚本
 # 作者: AMEI (基于原版修改)
-# 版本: 4.0 (防回退修复版)
-# 功能: 支持同时监控和同步多个独立的目录对，避免修改回退问题。
+# 版本: 4.1 (修复循环问题)
+# 功能: 支持同时监控和同步多个独立的目录对，避免时间戳循环。
 
 # --- 全局配置 (所有项目共享) ---
 SSH_USER="amei"
@@ -21,7 +21,7 @@ NORMAL_GROUP="amei"
 PROJECT_NAMES=(
     # "mallphp"
     # "adminvue"
-    # "chidian_store_uniapp"
+    "chidian_store_uniapp"
     "jgyc2023_com_cn"
     "chidian_store_uniapp2"
     "chidian_admin_frontend"
@@ -30,7 +30,7 @@ PROJECT_NAMES=(
 LINUX_DIRS=(
     # "/server/www/mallphp"
     # "/server/www/adminvue"
-    # "/server/www/chidian_store_uniapp"
+    "/server/www/chidian_store_uniapp"
     "/server/www/jgyc2023_com_cn"
     "/server/www/chidian_store_uniapp2"
     "/server/www/chidian_admin_frontend"
@@ -39,7 +39,7 @@ LINUX_DIRS=(
 WIN_DIRS=(
     # "D:\\www\\mallphp"   # PowerShell/Windows 路径
     # "D:\\www\\adminvue"
-    # "D:\\www\\chidian_store_uniapp"
+    "D:\\www\\chidian_store_uniapp"
     "D:\\www\\jgyc2023_com_cn"
     "D:\\www\\chidian_store_uniapp2"
     "D:\\www\\chidian_admin_frontend"
@@ -80,8 +80,8 @@ log() {
         "W-MON")    color="$C_GRAY";   symbol="🪟" ;;
         "ERROR")    color="$C_RED";    symbol="❌" ;;
         "MAIN")     color="$C_GREEN";  symbol="🎬" ;;
-        "SKIP")     color="$C_MAGENTA";symbol="⏭️" ;;  # 新增
-        "DEBUG")    color="$C_GRAY";   symbol="🔧" ;;  # 新增
+        "SKIP")     color="$C_MAGENTA";symbol="⏭️" ;;
+        "DEBUG")    color="$C_GRAY";   symbol="🔧" ;;
         *)          color="$C_RESET";  symbol="➡️" ;;
     esac
 
@@ -128,12 +128,12 @@ should_skip_sync() {
     current_time=$(date +%s)
     local time_diff=$((current_time - last_sync_time))
     
-    # 如果10秒内刚做过反向同步，则跳过
-    if [ "$direction" == "W2L" ] && [ "$last_sync_dir" == "L2W" ] && [ $time_diff -lt 10 ]; then
+    # 如果15秒内刚做过反向同步，则跳过（增加到15秒）
+    if [ "$direction" == "W2L" ] && [ "$last_sync_dir" == "L2W" ] && [ $time_diff -lt 15 ]; then
         log "$project_name" "SKIP" "跳过 W→L 同步（${time_diff}秒前刚执行过 L→W）"
         return 0  # 跳过
     fi
-    if [ "$direction" == "L2W" ] && [ "$last_sync_dir" == "W2L" ] && [ $time_diff -lt 10 ]; then
+    if [ "$direction" == "L2W" ] && [ "$last_sync_dir" == "W2L" ] && [ $time_diff -lt 15 ]; then
         log "$project_name" "SKIP" "跳过 L→W 同步（${time_diff}秒前刚执行过 W→L）"
         return 0  # 跳过
     fi
@@ -184,16 +184,21 @@ sync_linux_to_win() {
     log "$project_name" "SYNC" "L→W: 推送 Linux 变更..."
     local rsync_output_file; rsync_output_file=$(mktemp "/tmp/rsync_${project_name}_linux_out.XXXXXX")
     
-    # 使用 --update 参数，只同步更新的文件
-    rsync -avzi --update --no-owner --no-group --delete --modify-window=2 \
+    # 使用 --update 和 --omit-dir-times 避免不必要的目录时间戳更新
+    rsync -avzi --update --no-owner --no-group --delete \
+          --modify-window=2 --omit-dir-times \
           -e "ssh -p $SSH_PORT" --rsync-path="$WIN_RSYNC_PATH" \
           "${RSYNC_EXCLUDES[@]}" "$linux_dir/" "$SSH_USER@$SSH_HOST:$win_cygdrive_path/" > "$rsync_output_file" 2>&1
     local exit_code=$?
     
+    # 只输出实际有变化的内容（过滤掉只有时间戳变化的）
     if [ -s "$rsync_output_file" ]; then
-        log "$project_name" "SYNC_DETAIL" "--- rsync 输出 (L→W) ---"
-        sed 's/^/    /g' "$rsync_output_file" | tee -a "$LOG_FILE" > /dev/null
-        log "$project_name" "SYNC_DETAIL" "--- 结束输出 ---"
+        local has_real_changes=$(grep -v "^\.\*deleting" "$rsync_output_file" | grep -E "^[><cfhpguax]" | head -1)
+        if [ -n "$has_real_changes" ]; then
+            log "$project_name" "SYNC_DETAIL" "--- rsync 输出 (L→W) ---"
+            sed 's/^/    /g' "$rsync_output_file" | tee -a "$LOG_FILE" > /dev/null
+            log "$project_name" "SYNC_DETAIL" "--- 结束输出 ---"
+        fi
     fi
     
     rm -f "$rsync_output_file"
@@ -217,51 +222,79 @@ sync_win_to_linux() {
     log "$project_name" "SYNC" "W→L: 拉取 Windows 变更..."
     local rsync_output_file; rsync_output_file=$(mktemp "/tmp/rsync_${project_name}_win_out.XXXXXX")
     local final_exit_code=0
+    local has_real_changes=false
     
-    # 步骤 1: 同步目录结构（包括空目录）
-    rsync -d --recursive --no-owner --no-group --chmod=D755 --modify-window=2 \
+    # 步骤 1: 同步目录结构（使用 --omit-dir-times 避免更新目录时间戳）
+    rsync -d --recursive --no-owner --no-group --chmod=D755 \
+          --modify-window=2 --omit-dir-times \
           -e "ssh -p $SSH_PORT" --rsync-path="$WIN_RSYNC_PATH" \
           "${RSYNC_EXCLUDES[@]}" "$SSH_USER@$SSH_HOST:$win_cygdrive_path/" "$linux_dir/" > "$rsync_output_file" 2>&1
     
-    # 步骤 2: 更新已存在文件（保护权限，使用 --update）
-    rsync -rtzi --update --existing --no-owner --no-group --no-perms --modify-window=2 \
+    # 步骤 2: 更新已存在文件（保护权限，使用 --update 和 --omit-dir-times）
+    rsync -rtzi --update --existing --no-owner --no-group --no-perms \
+          --modify-window=2 --omit-dir-times \
           -e "ssh -p $SSH_PORT" --rsync-path="$WIN_RSYNC_PATH" \
           "${RSYNC_EXCLUDES[@]}" "$SSH_USER@$SSH_HOST:$win_cygdrive_path/" "$linux_dir/" >> "$rsync_output_file" 2>&1
     local exit_code_step1=$?
+    
+    # 检查是否有实际文件变化
+    if grep -E "^>f" "$rsync_output_file" > /dev/null 2>&1; then
+        has_real_changes=true
+    fi
+    
     if [ $exit_code_step1 -ne 0 ] && [ $exit_code_step1 -ne 24 ]; then 
         final_exit_code=$exit_code_step1
     fi
     
     # 步骤 3: 新增文件（设置权限）
-    rsync -rtzl --ignore-existing --chmod=D755,F644 --modify-window=2 \
+    rsync -rtzl --ignore-existing --chmod=D755,F644 \
+          --modify-window=2 --omit-dir-times \
           -e "ssh -p $SSH_PORT" --rsync-path="$WIN_RSYNC_PATH" \
           "${RSYNC_EXCLUDES[@]}" "$SSH_USER@$SSH_HOST:$win_cygdrive_path/" "$linux_dir/" >> "$rsync_output_file" 2>&1
     local exit_code_step2=$?
+    
+    # 检查是否有新文件
+    if grep -E "^>f\+\+\+\+\+\+\+\+\+" "$rsync_output_file" > /dev/null 2>&1; then
+        has_real_changes=true
+    fi
+    
     if [ $exit_code_step2 -ne 0 ] && [ $exit_code_step2 -ne 24 ]; then 
         final_exit_code=$exit_code_step2
     fi
     
     # 步骤 4: 删除多余文件
-    rsync -rd --delete --existing --ignore-non-existing --no-owner --no-group --no-perms --modify-window=2 \
+    rsync -rd --delete --existing --ignore-non-existing --no-owner --no-group --no-perms \
+          --modify-window=2 --omit-dir-times \
           -e "ssh -p $SSH_PORT" --rsync-path="$WIN_RSYNC_PATH" \
           "${RSYNC_EXCLUDES[@]}" "$SSH_USER@$SSH_HOST:$win_cygdrive_path/" "$linux_dir/" >> "$rsync_output_file" 2>&1
     local exit_code_step3=$?
+    
+    # 检查是否有删除
+    if grep -E "^\*deleting" "$rsync_output_file" > /dev/null 2>&1; then
+        has_real_changes=true
+    fi
+    
     if [ $exit_code_step3 -ne 0 ] && [ $exit_code_step3 -ne 24 ]; then 
         final_exit_code=$exit_code_step3
     fi
     
-    # 日志处理
-    if [ -s "$rsync_output_file" ]; then
+    # 只有实际有文件变化时才输出日志
+    if [ "$has_real_changes" = true ] && [ -s "$rsync_output_file" ]; then
         log "$project_name" "SYNC_DETAIL" "--- rsync 综合输出 (W→L) ---"
-        sed 's/^/    /g' "$rsync_output_file" | tee -a "$LOG_FILE" > /dev/null
+        # 过滤掉只有时间戳变化的目录
+        grep -v "^\.d\.\.t\.\.\.\.\.\." "$rsync_output_file" | sed 's/^/    /g' | tee -a "$LOG_FILE" > /dev/null
         log "$project_name" "SYNC_DETAIL" "--- 结束输出 ---"
     fi
     
     rm -f "$rsync_output_file"
     
     if [ $final_exit_code -eq 0 ] || [ $final_exit_code -eq 24 ]; then
-        record_sync "$project_name" "W2L"
-        log "$project_name" "INFO" "W→L 同步完成"
+        if [ "$has_real_changes" = true ]; then
+            record_sync "$project_name" "W2L"
+            log "$project_name" "INFO" "W→L 同步完成（有实际文件变化）"
+        else
+            log "$project_name" "INFO" "W→L 检查完成（仅时间戳差异，无实际变化）"
+        fi
     else
         log "$project_name" "ERROR" "W→L 拉取过程中发生错误 [代码 $final_exit_code]"
     fi
@@ -286,18 +319,34 @@ reconcile_and_sync() {
     fi
 }
 
-# --- 监控与触发器 (已参数化) ---
+# --- 监控与触发器（改进版）---
 monitor_linux_changes() {
     local project_name="$1" linux_dir="$2" change_flag_file="$3"
     log "$project_name" "L-MON" "开始监控 Linux: $linux_dir"
+    
+    # 添加一个同步后的忽略时间窗口
+    local ignore_file="$STATE_DIR/$project_name/ignore_until"
+    
     inotifywait -m -r -q -e create,delete,modify,move,close_write \
                 --excludei "$INOTIFY_EXCLUDE_PATTERN" \
                 "$linux_dir" |
     while read -r path action file; do
-        # 过滤掉属性变化事件
-        if [[ "$action" =~ "ATTRIB" ]]; then
+        # 过滤掉属性变化事件和目录的时间戳事件
+        if [[ "$action" =~ (ATTRIB|ISDIR) ]]; then
             continue
         fi
+        
+        # 检查是否在忽略时间窗口内
+        if [ -f "$ignore_file" ]; then
+            local ignore_until=$(cat "$ignore_file")
+            local current_time=$(date +%s)
+            if [ "$current_time" -lt "$ignore_until" ]; then
+                continue  # 忽略这个事件
+            else
+                rm -f "$ignore_file"  # 清理过期的忽略标记
+            fi
+        fi
+        
         touch "$change_flag_file"
     done
 }
@@ -319,6 +368,11 @@ debounce_and_sync_linux() {
                 sleep 3  # 增加到3秒
             done
             log "$project_name" "INFO" "文件系统已稳定。"
+            
+            # 设置忽略时间窗口（同步后5秒内忽略变化）
+            local ignore_file="$STATE_DIR/$project_name/ignore_until"
+            echo $(($(date +%s) + 5)) > "$ignore_file"
+            
             reconcile_and_sync "$project_name" "$linux_dir" "$win_cygdrive_path" "linux"
             release_lock "$project_name" "$lock_file"
         fi
@@ -329,33 +383,86 @@ monitor_windows_changes() {
     local project_name="$1" linux_dir="$2" win_cygdrive_path="$3" \
           lock_file="$4"
           
-    log "$project_name" "W-MON" "开始轮询 Windows (间隔 10s)..."
+    log "$project_name" "W-MON" "开始轮询 Windows (间隔 8s)..."
+    
     while true; do
-        sleep 10
-        # 使用 --update 参数进行dry-run
-        local rsync_args=(-rtin --update --delete --no-owner --no-group --no-perms --modify-window=2 \
-                         -e "ssh -p $SSH_PORT" --rsync-path="$WIN_RSYNC_PATH" \
-                         "${RSYNC_EXCLUDES[@]}" "$SSH_USER@$SSH_HOST:$win_cygdrive_path/" "$linux_dir/")
-        local dry_run_output
-        dry_run_output=$(rsync "${rsync_args[@]}" 2>&1)
+        sleep 8
+        
+        # 简化的检测：直接尝试同步，让 rsync 自己判断是否有变化
+        local temp_output
+        temp_output=$(rsync -rtin --delete --no-owner --no-group --no-perms \
+                     --modify-window=2 \
+                     -e "ssh -p $SSH_PORT" --rsync-path="$WIN_RSYNC_PATH" \
+                     "${RSYNC_EXCLUDES[@]}" "$SSH_USER@$SSH_HOST:$win_cygdrive_path/" "$linux_dir/" 2>&1)
         local exit_code=$?
         
-        if [ $exit_code -ne 0 ] && [ $exit_code -ne 24 ]; then
-            log "$project_name" "ERROR" "W-MON rsync dry-run 失败 [代码 $exit_code]。"
-            sleep 20; continue
-        fi
-        
-        # 检测变化（包括新目录）
-        if echo "$dry_run_output" | grep -q -E '^[.><*c]|^cd\+\+\+\+\+\+\+\+\+'; then
-            echo | tee -a "$LOG_FILE"
-            log "$project_name" "EVENT" "检测到 Windows 目录有变化"
-            if acquire_lock "$project_name" "$lock_file" "Sync from Windows"; then
-                reconcile_and_sync "$project_name" "$linux_dir" "$win_cygdrive_path" "windows"
-                release_lock "$project_name" "$lock_file"
+        # 如果有输出且不是错误，说明有变化
+        if [ $exit_code -eq 0 ] || [ $exit_code -eq 24 ]; then
+            if echo "$temp_output" | grep -E "^[><cfhpguax\*]" > /dev/null 2>&1; then
+                echo | tee -a "$LOG_FILE"
+                log "$project_name" "EVENT" "检测到 Windows 变化"
+                if acquire_lock "$project_name" "$lock_file" "Sync from Windows"; then
+                    reconcile_and_sync "$project_name" "$linux_dir" "$win_cygdrive_path" "windows"
+                    release_lock "$project_name" "$lock_file"
+                fi
             fi
+        else
+            log "$project_name" "DEBUG" "Windows 检测出错，代码: $exit_code"
         fi
     done
 }
+#monitor_windows_changes() {
+#    local project_name="$1" linux_dir="$2" win_cygdrive_path="$3" \
+#          lock_file="$4"
+#          
+#    log "$project_name" "W-MON" "开始轮询 Windows (间隔 10s)..."
+#    
+#    # 保存上次检测的状态哈希
+#    local last_hash_file="$STATE_DIR/$project_name/windows_hash"
+#    
+#    while true; do
+#        sleep 10
+#        
+#        # 使用更严格的dry-run，忽略时间戳差异
+#        local rsync_args=(-rtin --update --delete --no-owner --no-group --no-perms \
+#                         --modify-window=2 --omit-dir-times --size-only \
+#                         -e "ssh -p $SSH_PORT" --rsync-path="$WIN_RSYNC_PATH" \
+#                         "${RSYNC_EXCLUDES[@]}" "$SSH_USER@$SSH_HOST:$win_cygdrive_path/" "$linux_dir/")
+#        local dry_run_output
+#        dry_run_output=$(rsync "${rsync_args[@]}" 2>&1)
+#        local exit_code=$?
+#        
+#        if [ $exit_code -ne 0 ] && [ $exit_code -ne 24 ]; then
+#            log "$project_name" "ERROR" "W-MON rsync dry-run 失败 [代码 $exit_code]。"
+#            sleep 20; continue
+#        fi
+#        
+#        # 生成内容哈希（排除只有时间戳的变化）
+#        local current_hash=$(echo "$dry_run_output" | grep -v "^\.\*deleting" | grep -E "^[><cfhpguax]" | md5sum | cut -d' ' -f1)
+#        
+#        # 读取上次的哈希
+#        local last_hash=""
+#        if [ -f "$last_hash_file" ]; then
+#            last_hash=$(cat "$last_hash_file")
+#        fi
+#        
+#        # 只有内容真正变化时才触发同步
+#        if [ -n "$current_hash" ] && [ "$current_hash" != "$last_hash" ]; then
+#            # 检查是否有实际的文件变化（不只是目录时间戳）
+#            if echo "$dry_run_output" | grep -E "^[><cfhpguax]" | grep -v "^\.d\.\.t" > /dev/null 2>&1; then
+#                echo | tee -a "$LOG_FILE"
+#                log "$project_name" "EVENT" "检测到 Windows 目录有实际变化"
+#                if acquire_lock "$project_name" "$lock_file" "Sync from Windows"; then
+#                    reconcile_and_sync "$project_name" "$linux_dir" "$win_cygdrive_path" "windows"
+#                    release_lock "$project_name" "$lock_file"
+#                fi
+#            fi
+#        fi
+#        
+#        # 保存当前哈希
+#        echo "$current_hash" > "$last_hash_file"
+#    done
+#}
 
 # --- 脚本主程序 ---
 main() {
