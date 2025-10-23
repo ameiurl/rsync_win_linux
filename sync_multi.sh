@@ -19,30 +19,21 @@ NORMAL_GROUP="amei"
 
 # --- 项目配置 (关键改动) ---
 PROJECT_NAMES=(
-    # "mallphp"
-    # "adminvue"
-    "chidian_store_uniapp"
     "jgyc2023_com_cn"
-    "chidian_store_uniapp2"
     "chidian_admin_frontend"
+    "chidian_store_uniapp"
 )
 
 LINUX_DIRS=(
-    # "/server/www/mallphp"
-    # "/server/www/adminvue"
-    "/server/www/chidian_store_uniapp"
     "/server/www/jgyc2023_com_cn"
-    "/server/www/chidian_store_uniapp2"
     "/server/www/chidian_admin_frontend"
+    "/server/www/chidian_store_uniapp"
 )
 
 WIN_DIRS=(
-    # "D:\\www\\mallphp"   # PowerShell/Windows 路径
-    # "D:\\www\\adminvue"
-    "D:\\www\\chidian_store_uniapp"
     "D:\\www\\jgyc2023_com_cn"
-    "D:\\www\\chidian_store_uniapp2"
     "D:\\www\\chidian_admin_frontend"
+    "D:\\www\\chidian_store_uniapp"
 )
 
 # --- 全局排除列表 (所有项目共享) ---
@@ -411,58 +402,6 @@ monitor_windows_changes() {
         fi
     done
 }
-#monitor_windows_changes() {
-#    local project_name="$1" linux_dir="$2" win_cygdrive_path="$3" \
-#          lock_file="$4"
-#          
-#    log "$project_name" "W-MON" "开始轮询 Windows (间隔 10s)..."
-#    
-#    # 保存上次检测的状态哈希
-#    local last_hash_file="$STATE_DIR/$project_name/windows_hash"
-#    
-#    while true; do
-#        sleep 10
-#        
-#        # 使用更严格的dry-run，忽略时间戳差异
-#        local rsync_args=(-rtin --update --delete --no-owner --no-group --no-perms \
-#                         --modify-window=2 --omit-dir-times --size-only \
-#                         -e "ssh -p $SSH_PORT" --rsync-path="$WIN_RSYNC_PATH" \
-#                         "${RSYNC_EXCLUDES[@]}" "$SSH_USER@$SSH_HOST:$win_cygdrive_path/" "$linux_dir/")
-#        local dry_run_output
-#        dry_run_output=$(rsync "${rsync_args[@]}" 2>&1)
-#        local exit_code=$?
-#        
-#        if [ $exit_code -ne 0 ] && [ $exit_code -ne 24 ]; then
-#            log "$project_name" "ERROR" "W-MON rsync dry-run 失败 [代码 $exit_code]。"
-#            sleep 20; continue
-#        fi
-#        
-#        # 生成内容哈希（排除只有时间戳的变化）
-#        local current_hash=$(echo "$dry_run_output" | grep -v "^\.\*deleting" | grep -E "^[><cfhpguax]" | md5sum | cut -d' ' -f1)
-#        
-#        # 读取上次的哈希
-#        local last_hash=""
-#        if [ -f "$last_hash_file" ]; then
-#            last_hash=$(cat "$last_hash_file")
-#        fi
-#        
-#        # 只有内容真正变化时才触发同步
-#        if [ -n "$current_hash" ] && [ "$current_hash" != "$last_hash" ]; then
-#            # 检查是否有实际的文件变化（不只是目录时间戳）
-#            if echo "$dry_run_output" | grep -E "^[><cfhpguax]" | grep -v "^\.d\.\.t" > /dev/null 2>&1; then
-#                echo | tee -a "$LOG_FILE"
-#                log "$project_name" "EVENT" "检测到 Windows 目录有实际变化"
-#                if acquire_lock "$project_name" "$lock_file" "Sync from Windows"; then
-#                    reconcile_and_sync "$project_name" "$linux_dir" "$win_cygdrive_path" "windows"
-#                    release_lock "$project_name" "$lock_file"
-#                fi
-#            fi
-#        fi
-#        
-#        # 保存当前哈希
-#        echo "$current_hash" > "$last_hash_file"
-#    done
-#}
 
 # --- 脚本主程序 ---
 main() {
