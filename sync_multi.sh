@@ -17,24 +17,25 @@ STATE_DIR="/tmp/sync_state"  # 新增：状态目录
 NORMAL_USER="amei"
 NORMAL_GROUP="amei"
 
-# --- 项目配置 (关键改动) ---
-PROJECT_NAMES=(
-    "jgyc2023_com_cn"
-    "chidian_admin_frontend"
-    "chidian_store_uniapp"
+PROJECT_BASE_NAMES=(
+    "mallphp"
+    "mallphp_alkanes"
+    "admin_frontend_dev"
+    "admin_frontend_hzy"
+    "store_uniapp"
 )
 
-LINUX_DIRS=(
-    "/server/www/jgyc2023_com_cn"
-    "/server/www/chidian_admin_frontend"
-    "/server/www/chidian_store_uniapp"
-)
+# 以下数组将根据 PROJECT_BASE_NAMES 自动生成，无需手动修改
+PROJECT_NAMES=()
+LINUX_DIRS=()
+WIN_DIRS=()
 
-WIN_DIRS=(
-    "D:\\www\\jgyc2023_com_cn"
-    "D:\\www\\chidian_admin_frontend"
-    "D:\\www\\chidian_store_uniapp"
-)
+# 自动生成项目名称和目录路径
+for name in "${PROJECT_BASE_NAMES[@]}"; do
+    PROJECT_NAMES+=("$name")
+    LINUX_DIRS+=("/server/www/$name")
+    WIN_DIRS+=("D:\\www\\$name")
+done
 
 # --- 全局排除列表 (所有项目共享) ---
 RSYNC_EXCLUDES=(
