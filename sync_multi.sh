@@ -19,9 +19,8 @@ NORMAL_GROUP="amei"
 
 PROJECT_BASE_NAMES=(
     "mallphp"
-    "mallphp_alkanes"
-    "admin_frontend_dev"
-    "admin_frontend_hzy"
+    "admin_frontend"
+    "admin_diy_frontend"
     "store_uniapp"
 )
 
