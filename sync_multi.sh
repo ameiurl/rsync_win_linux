@@ -1,8 +1,14 @@
 #!/bin/bash
 # 权限修复与防抖增强版 - 多项目双向实时监控同步脚本
 # 作者: AMEI (基于原版修改)
-# 版本: 4.1 (修复循环问题)
-# 功能: 支持同时监控和同步多个独立的目录对，避免时间戳循环。
+# 版本: 5.0 (支持单向/双向模式切换)
+# 功能: 支持同时监控和同步多个独立的目录对，可选单向或双向同步
+
+# --- 同步模式配置 ---
+# 可选值: "bidirectional" (双向) 或 "unidirectional" (单向: Linux → Windows)
+# 可通过命令行参数覆盖: --mode=unidirectional 或 --mode=bidirectional
+# 简写: -u (单向) 或 -b (双向)
+SYNC_MODE=unidirectional
 
 # --- 全局配置 (所有项目共享) ---
 SSH_USER="amei"
@@ -11,7 +17,7 @@ SSH_PORT="22"
 WIN_RSYNC_PATH="\"D:/Program Files (x86)/cwRsync/bin/rsync.exe\"" # 注意引号的使用
 LOG_FILE="/home/amei/multi_sync.log"
 PID_FILE="/tmp/multi_sync.pid"
-STATE_DIR="/tmp/sync_state"  # 新增：状态目录
+STATE_DIR="/tmp/sync_state"  # 状态目录（双向模式使用）
 
 # 权限修复相关
 NORMAL_USER="amei"
@@ -48,6 +54,39 @@ RSYNC_EXCLUDES=(
 INOTIFY_EXCLUDE_PATTERN='(\.git/|\.svn/|\.idea/|\.vscode/|node_modules/|runtime/|unpackage/|cache/|^config/database\.local\.php$|\.bak$|\.env$|\.log$|\.tmp$|\.swp$|^~\$.*)'
 INOTIFY_EXCLUDE_PATTERN=$(echo "$INOTIFY_EXCLUDE_PATTERN" | tr -d ' \n')
 
+# --- 命令行参数解析 ---
+parse_arguments() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -u|--unidirectional|--one-way)
+                SYNC_MODE="unidirectional"
+                shift
+                ;;
+            -b|--bidirectional|--two-way)
+                SYNC_MODE="bidirectional"
+                shift
+                ;;
+            --mode=*)
+                SYNC_MODE="${1#*=}"
+                shift
+                ;;
+            -h|--help)
+                exit 0
+                ;;
+            *)
+                echo -e "\033[0;31m❌ 未知参数: $1\033[0m"
+                exit 1
+                ;;
+        esac
+    done
+    
+    # 验证模式值
+    if [[ "$SYNC_MODE" != "bidirectional" && "$SYNC_MODE" != "unidirectional" ]]; then
+        echo -e "\033[0;31m❌ 无效的同步模式: $SYNC_MODE\033[0m"
+        echo "有效值: bidirectional (双向) 或 unidirectional (单向)"
+        exit 1
+    fi
+}
 # --- 工具函数 ---
 log() {
     local project_name="$1"
@@ -73,6 +112,8 @@ log() {
         "MAIN")     color="$C_GREEN";  symbol="🎬" ;;
         "SKIP")     color="$C_MAGENTA";symbol="⏭️" ;;
         "DEBUG")    color="$C_GRAY";   symbol="🔧" ;;
+        "SUCCESS")  color="$C_GREEN";  symbol="✅" ;;
+        "MODE")     color="$C_YELLOW"; symbol="⚙️" ;;
         *)          color="$C_RESET";  symbol="➡️" ;;
     esac
 
@@ -85,24 +126,39 @@ log() {
     fi
 }
 
-# 确保状态目录存在
-ensure_state_dir() {
-    mkdir -p "$STATE_DIR"
-    for project_name in "${PROJECT_NAMES[@]}"; do
-        mkdir -p "$STATE_DIR/$project_name"
-    done
+# 检查是否为双向模式
+is_bidirectional() {
+    [[ "$SYNC_MODE" == "bidirectional" ]]
 }
 
-# 记录同步操作（防回环）
+# 确保状态目录存在（仅双向模式需要）
+ensure_state_dir() {
+    if is_bidirectional; then
+        mkdir -p "$STATE_DIR"
+        for project_name in "${PROJECT_NAMES[@]}"; do
+            mkdir -p "$STATE_DIR/$project_name"
+        done
+    fi
+}
+
+# 记录同步操作（防回环，仅双向模式使用）
 record_sync() {
+    if ! is_bidirectional; then
+        return 0
+    fi
+    
     local project_name="$1"
     local direction="$2"  # "L2W" 或 "W2L"
     local state_file="$STATE_DIR/$project_name/last_sync"
     echo "$(date +%s):$direction" > "$state_file"
 }
 
-# 检查是否刚刚同步过（避免回环）
+# 检查是否刚刚同步过（避免回环，仅双向模式使用）
 should_skip_sync() {
+    if ! is_bidirectional; then
+        return 1  # 单向模式不需要跳过
+    fi
+    
     local project_name="$1"
     local direction="$2"
     local state_file="$STATE_DIR/$project_name/last_sync"
@@ -167,8 +223,8 @@ release_lock() {
 sync_linux_to_win() {
     local project_name="$1" linux_dir="$2" win_cygdrive_path="$3"
     
-    # 检查防回环
-    if should_skip_sync "$project_name" "L2W"; then
+    # 双向模式下检查防回环
+    if is_bidirectional && should_skip_sync "$project_name" "L2W"; then
         return 0
     fi
     
@@ -204,6 +260,11 @@ sync_linux_to_win() {
 
 sync_win_to_linux() {
     local project_name="$1" linux_dir="$2" win_cygdrive_path="$3"
+    
+    # 单向模式下直接返回
+    if ! is_bidirectional; then
+        return 0
+    fi
     
     # 检查防回环
     if should_skip_sync "$project_name" "W2L"; then
@@ -299,14 +360,21 @@ reconcile_and_sync() {
         # Linux变化时，只推送到Windows
         sync_linux_to_win "$project_name" "$linux_dir" "$win_cygdrive_path"
     elif [[ "$trigger_source" == "windows" ]]; then
-        # Windows变化时，只拉取到Linux
-        sync_win_to_linux "$project_name" "$linux_dir" "$win_cygdrive_path"
+        # Windows变化时，只拉取到Linux（仅双向模式）
+        if is_bidirectional; then
+            sync_win_to_linux "$project_name" "$linux_dir" "$win_cygdrive_path"
+        fi
     else
-        # 启动时执行双向同步，但有间隔
-        log "$project_name" "INIT" "执行初始化双向同步..."
-        sync_linux_to_win "$project_name" "$linux_dir" "$win_cygdrive_path"
-        sleep 3  # 等待3秒
-        sync_win_to_linux "$project_name" "$linux_dir" "$win_cygdrive_path"
+        # 启动时执行同步
+        if is_bidirectional; then
+            log "$project_name" "INIT" "执行初始化双向同步..."
+            sync_linux_to_win "$project_name" "$linux_dir" "$win_cygdrive_path"
+            sleep 3  # 等待3秒
+            sync_win_to_linux "$project_name" "$linux_dir" "$win_cygdrive_path"
+        else
+            log "$project_name" "INIT" "执行初始化单向同步 (L→W)..."
+            sync_linux_to_win "$project_name" "$linux_dir" "$win_cygdrive_path"
+        fi
     fi
 }
 
@@ -315,7 +383,7 @@ monitor_linux_changes() {
     local project_name="$1" linux_dir="$2" change_flag_file="$3"
     log "$project_name" "L-MON" "开始监控 Linux: $linux_dir"
     
-    # 添加一个同步后的忽略时间窗口
+    # 添加一个同步后的忽略时间窗口（仅双向模式使用）
     local ignore_file="$STATE_DIR/$project_name/ignore_until"
     
     inotifywait -m -r -q -e create,delete,modify,move,close_write \
@@ -327,8 +395,8 @@ monitor_linux_changes() {
             continue
         fi
         
-        # 检查是否在忽略时间窗口内
-        if [ -f "$ignore_file" ]; then
+        # 双向模式下检查是否在忽略时间窗口内
+        if is_bidirectional && [ -f "$ignore_file" ]; then
             local ignore_until=$(cat "$ignore_file")
             local current_time=$(date +%s)
             if [ "$current_time" -lt "$ignore_until" ]; then
@@ -360,9 +428,11 @@ debounce_and_sync_linux() {
             done
             log "$project_name" "INFO" "文件系统已稳定。"
             
-            # 设置忽略时间窗口（同步后5秒内忽略变化）
-            local ignore_file="$STATE_DIR/$project_name/ignore_until"
-            echo $(($(date +%s) + 5)) > "$ignore_file"
+            # 双向模式下设置忽略时间窗口（同步后5秒内忽略变化）
+            if is_bidirectional; then
+                local ignore_file="$STATE_DIR/$project_name/ignore_until"
+                echo $(($(date +%s) + 5)) > "$ignore_file"
+            fi
             
             reconcile_and_sync "$project_name" "$linux_dir" "$win_cygdrive_path" "linux"
             release_lock "$project_name" "$lock_file"
@@ -370,9 +440,16 @@ debounce_and_sync_linux() {
     done
 }
 
+# Windows 监控函数（仅双向模式使用）
 monitor_windows_changes() {
     local project_name="$1" linux_dir="$2" win_cygdrive_path="$3" \
           lock_file="$4"
+    
+    # 单向模式下直接返回
+    if ! is_bidirectional; then
+        log "$project_name" "W-MON" "单向模式，跳过 Windows 监控"
+        return 0
+    fi
           
     log "$project_name" "W-MON" "开始轮询 Windows (间隔 8s)..."
     
@@ -405,6 +482,9 @@ monitor_windows_changes() {
 
 # --- 脚本主程序 ---
 main() {
+    # 解析命令行参数
+    parse_arguments "$@"
+    
     # 检查全局 PID 文件
     if [ -f "$PID_FILE" ] && ps -p "$(cat "$PID_FILE")" > /dev/null; then
         echo -e "\033[0;31m❌ 主脚本已在运行 (PID: $(cat "$PID_FILE"))。请先停止旧实例。\033[0m"
@@ -412,8 +492,11 @@ main() {
     fi
     echo $$ > "$PID_FILE"
     
-    # 确保状态目录存在
+    # 确保状态目录存在（仅双向模式需要）
     ensure_state_dir
+    
+    # 存储所有子进程PID
+    declare -a ALL_PIDS=()
     
     # 清理函数
     cleanup() {
@@ -422,7 +505,10 @@ main() {
         for project_name in "${PROJECT_NAMES[@]}"; do
             rm -f "/tmp/rsync_${project_name}.lock" "/tmp/${project_name}_change.flag"
         done
-        rm -rf "$STATE_DIR"
+        # 仅双向模式有状态目录
+        if is_bidirectional; then
+            rm -rf "$STATE_DIR"
+        fi
         if [ ${#ALL_PIDS[@]} -gt 0 ]; then
             echo -e "\033[0;33mℹ️  正在停止所有子进程: ${ALL_PIDS[*]}\033[0m"
             kill "${ALL_PIDS[@]}" 2>/dev/null
@@ -437,6 +523,14 @@ main() {
     # 脚本启动日志
     echo | tee -a "$LOG_FILE"
     log "MAIN" "INIT" "================== 脚本启动 (PID: $$) =================="
+    
+    # 显示同步模式
+    if is_bidirectional; then
+        log "MAIN" "MODE" "同步模式: 双向 (Linux ⇄ Windows)"
+    else
+        log "MAIN" "MODE" "同步模式: 单向 (Linux → Windows)"
+    fi
+    
     mkdir -p "$(dirname "$LOG_FILE")"
     touch "$LOG_FILE" || { echo "错误：无法创建或写入日志文件 $LOG_FILE"; exit 1; }
     
@@ -456,19 +550,36 @@ main() {
         rm -f "$lock_file" "$change_flag_file"
         reconcile_and_sync "$project_name" "$linux_dir" "$win_cygdrive_path" "startup"
         
+        # 启动 Linux 监控（始终需要）
         monitor_linux_changes "$project_name" "$linux_dir" "$change_flag_file" &
         ALL_PIDS+=($!)
+        log "$project_name" "INFO" "Linux 监控进程已启动 (PID: ${ALL_PIDS[-1]})"
+        
+        # 启动 Linux 防抖同步
         debounce_and_sync_linux "$project_name" "$linux_dir" "$win_cygdrive_path" "$lock_file" "$change_flag_file" &
         ALL_PIDS+=($!)
-        monitor_windows_changes "$project_name" "$linux_dir" "$win_cygdrive_path" "$lock_file" &
-        ALL_PIDS+=($!)
+        log "$project_name" "INFO" "Linux 同步进程已启动 (PID: ${ALL_PIDS[-1]})"
+        
+        # 仅双向模式启动 Windows 监控
+        if is_bidirectional; then
+            monitor_windows_changes "$project_name" "$linux_dir" "$win_cygdrive_path" "$lock_file" &
+            ALL_PIDS+=($!)
+            log "$project_name" "INFO" "Windows 监控进程已启动 (PID: ${ALL_PIDS[-1]})"
+        fi
     done
     
     echo | tee -a "$LOG_FILE"
     log "MAIN" "INIT" "所有项目的监控进程已启动。"
     log "MAIN" "INFO" "所有子进程 PIDs: ${ALL_PIDS[*]}"
     log "MAIN" "INFO" "日志文件位于: $LOG_FILE"
-    echo -e "\033[0;32m✅ 脚本正在后台运行，按 Ctrl+C 停止。\033[0m"
+    
+    if is_bidirectional; then
+        echo -e "\033[0;32m✅ 双向同步正在运行 (Linux ⇄ Windows)\033[0m"
+    else
+        echo -e "\033[0;32m✅ 单向同步正在运行 (Linux → Windows)\033[0m"
+    fi
+    echo -e "\033[0;33m📌 按 Ctrl+C 停止脚本\033[0m"
+    
     wait
 }
 
