@@ -28,6 +28,9 @@ PROJECT_BASE_NAMES=(
     "admin_frontend"
     "admin_diy_frontend"
     "store_uniapp"
+    "mallphp2"
+    "admin_frontend2"
+    "store_uniapp2"
 )
 
 # 以下数组将根据 PROJECT_BASE_NAMES 自动生成，无需手动修改
@@ -46,7 +49,7 @@ done
 RSYNC_EXCLUDES=(
     "--exclude=.git/" "--exclude=.svn/" "--exclude=.idea/" "--exclude=.vscode/"
     "--exclude=node_modules/" "--exclude=runtime/" "--exclude=unpackage/" "--exclude=cache/"
-    "--exclude=/config/database.local.php" "--exclude=*.bak" "--exclude=.env"
+    "--exclude=/config/database.local.php" "--exclude=*.bak" "--exclude=.env" "--exclude=.env.development"
     "--exclude=*.log" "--exclude=*.tmp" "--exclude=*.swp" "--exclude=~$*"
 )
 
