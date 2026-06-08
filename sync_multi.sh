@@ -11,8 +11,8 @@
 SYNC_MODE=unidirectional
 
 # --- 全局配置 (所有项目共享) ---
-SSH_USER="amei"
-SSH_HOST="192.168.1.3"
+SSH_USER="Administrator"
+SSH_HOST="192.168.1.9"
 SSH_PORT="22"
 WIN_RSYNC_PATH="\"D:/Program Files (x86)/cwRsync/bin/rsync.exe\"" # 注意引号的使用
 LOG_FILE="/home/amei/multi_sync.log"
@@ -26,11 +26,7 @@ NORMAL_GROUP="amei"
 PROJECT_BASE_NAMES=(
     "mallphp"
     "admin_frontend"
-    "admin_diy_frontend"
     "store_uniapp"
-    "mallphp2"
-    "admin_frontend2"
-    "store_uniapp2"
 )
 
 # 以下数组将根据 PROJECT_BASE_NAMES 自动生成，无需手动修改
@@ -225,22 +221,37 @@ release_lock() {
 # --- 核心同步函数（修复版）---
 sync_linux_to_win() {
     local project_name="$1" linux_dir="$2" win_cygdrive_path="$3"
-    
+
     # 双向模式下检查防回环
     if is_bidirectional && should_skip_sync "$project_name" "L2W"; then
         return 0
     fi
-    
+
     log "$project_name" "SYNC" "L→W: 推送 Linux 变更..."
     local rsync_output_file; rsync_output_file=$(mktemp "/tmp/rsync_${project_name}_linux_out.XXXXXX")
-    
-    # 使用 --update 和 --omit-dir-times 避免不必要的目录时间戳更新
-    rsync -avzi --update --no-owner --no-group --delete \
-          --modify-window=2 --omit-dir-times \
-          -e "ssh -p $SSH_PORT" --rsync-path="$WIN_RSYNC_PATH" \
-          "${RSYNC_EXCLUDES[@]}" "$linux_dir/" "$SSH_USER@$SSH_HOST:$win_cygdrive_path/" > "$rsync_output_file" 2>&1
-    local exit_code=$?
-    
+    local exit_code=0
+    local max_retries=5
+    local attempt=1
+
+    while [ $attempt -le $max_retries ]; do
+        # 使用 --update 和 --omit-dir-times 避免不必要的目录时间戳更新
+        rsync -avzi --update --no-owner --no-group --delete \
+              --modify-window=2 --omit-dir-times \
+              -e "ssh -p $SSH_PORT" --rsync-path="$WIN_RSYNC_PATH" \
+              "${RSYNC_EXCLUDES[@]}" "$linux_dir/" "$SSH_USER@$SSH_HOST:$win_cygdrive_path/" > "$rsync_output_file" 2>&1
+        exit_code=$?
+
+        # 退出码 12 (protocol data stream error) 是 cwRsync 的间歇性 socket 问题，重试即可恢复
+        if [ $exit_code -eq 12 ] && [ $attempt -lt $max_retries ]; then
+            local delay=$((1 + RANDOM % 4))  # 1-4 秒随机延迟，打破时序共振
+            log "$project_name" "INFO" "L→W socket 错误 [代码 12]，${attempt}/${max_retries} 次重试，等待 ${delay} 秒..."
+            sleep "$delay"
+            ((attempt++))
+            continue
+        fi
+        break
+    done
+
     # 只输出实际有变化的内容（过滤掉只有时间戳变化的）
     if [ -s "$rsync_output_file" ]; then
         local has_real_changes=$(grep -v "^\.\*deleting" "$rsync_output_file" | grep -E "^[><cfhpguax]" | head -1)
@@ -250,14 +261,14 @@ sync_linux_to_win() {
             log "$project_name" "SYNC_DETAIL" "--- 结束输出 ---"
         fi
     fi
-    
+
     rm -f "$rsync_output_file"
-    
+
     if [ $exit_code -eq 0 ] || [ $exit_code -eq 24 ]; then
         record_sync "$project_name" "L2W"
         log "$project_name" "INFO" "L→W 同步完成"
     else
-        log "$project_name" "ERROR" "L→W 推送失败 [代码 $exit_code]"
+        log "$project_name" "ERROR" "L→W 推送失败 [代码 $exit_code]（已重试 $((attempt - 1)) 次）"
     fi
 }
 
