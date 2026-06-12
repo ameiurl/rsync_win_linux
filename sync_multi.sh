@@ -46,7 +46,7 @@ RSYNC_EXCLUDES=(
     "--exclude=.git/" "--exclude=.svn/" "--exclude=.idea/" "--exclude=.vscode/"
     "--exclude=node_modules/" "--exclude=runtime/" "--exclude=unpackage/" "--exclude=cache/"
     "--exclude=/config/database.local.php" "--exclude=*.bak" "--exclude=.env" "--exclude=.env.development"
-    "--exclude=*.log" "--exclude=*.tmp" "--exclude=*.swp" "--exclude=~$*"
+    "--exclude=*.log" "--exclude=*.tmp" "--exclude=*.swp" "--exclude=*.zip" "--exclude=~$*"
 )
 
 # inotifywait ERE 正则表达式格式
@@ -230,7 +230,7 @@ sync_linux_to_win() {
     log "$project_name" "SYNC" "L→W: 推送 Linux 变更..."
     local rsync_output_file; rsync_output_file=$(mktemp "/tmp/rsync_${project_name}_linux_out.XXXXXX")
     local exit_code=0
-    local max_retries=5
+    local max_retries=10
     local attempt=1
 
     while [ $attempt -le $max_retries ]; do
