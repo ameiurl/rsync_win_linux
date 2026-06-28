@@ -11,10 +11,12 @@
 SYNC_MODE=unidirectional
 
 # --- 全局配置 (所有项目共享) ---
-SSH_USER="Administrator"
-SSH_HOST="192.168.1.9"
+SSH_USER="amei"
+SSH_HOST="192.168.1.3"
 SSH_PORT="22"
 WIN_RSYNC_PATH="\"D:/Program Files (x86)/cwRsync/bin/rsync.exe\"" # 注意引号的使用
+SSH_OPTS="-p $SSH_PORT -o ControlMaster=auto -o ControlPath=/tmp/ssh_mux_%r@%h:%p -o ControlPersist=60"
+RETRY_MAX=10
 LOG_FILE="/home/amei/multi_sync.log"
 PID_FILE="/tmp/multi_sync.pid"
 STATE_DIR="/tmp/sync_state"  # 状态目录（双向模式使用）
@@ -51,7 +53,6 @@ RSYNC_EXCLUDES=(
 
 # inotifywait ERE 正则表达式格式
 INOTIFY_EXCLUDE_PATTERN='(\.git/|\.svn/|\.idea/|\.vscode/|node_modules/|runtime/|unpackage/|cache/|^config/database\.local\.php$|\.bak$|\.env$|\.log$|\.tmp$|\.swp$|^~\$.*)'
-INOTIFY_EXCLUDE_PATTERN=$(echo "$INOTIFY_EXCLUDE_PATTERN" | tr -d ' \n')
 
 # --- 命令行参数解析 ---
 parse_arguments() {
@@ -237,7 +238,7 @@ sync_linux_to_win() {
         # 使用 --update 和 --omit-dir-times 避免不必要的目录时间戳更新
         rsync -avzi --update --no-owner --no-group --delete \
               --modify-window=2 --omit-dir-times \
-              -e "ssh -p $SSH_PORT" --rsync-path="$WIN_RSYNC_PATH" \
+              -e "ssh $SSH_OPTS" --rsync-path="$WIN_RSYNC_PATH" \
               "${RSYNC_EXCLUDES[@]}" "$linux_dir/" "$SSH_USER@$SSH_HOST:$win_cygdrive_path/" > "$rsync_output_file" 2>&1
         exit_code=$?
 
@@ -254,7 +255,7 @@ sync_linux_to_win() {
 
     # 只输出实际有变化的内容（过滤掉只有时间戳变化的）
     if [ -s "$rsync_output_file" ]; then
-        local has_real_changes=$(grep -v "^\.\*deleting" "$rsync_output_file" | grep -E "^[><cfhpguax]" | head -1)
+        local has_real_changes=$(grep -E "^[><cfhpguax*]" "$rsync_output_file" | head -1)
         if [ -n "$has_real_changes" ]; then
             log "$project_name" "SYNC_DETAIL" "--- rsync 输出 (L→W) ---"
             sed 's/^/    /g' "$rsync_output_file" | tee -a "$LOG_FILE" > /dev/null
@@ -274,86 +275,129 @@ sync_linux_to_win() {
 
 sync_win_to_linux() {
     local project_name="$1" linux_dir="$2" win_cygdrive_path="$3"
-    
-    # 单向模式下直接返回
+
     if ! is_bidirectional; then
         return 0
     fi
-    
-    # 检查防回环
+
     if should_skip_sync "$project_name" "W2L"; then
         return 0
     fi
-    
+
     log "$project_name" "SYNC" "W→L: 拉取 Windows 变更..."
     local rsync_output_file; rsync_output_file=$(mktemp "/tmp/rsync_${project_name}_win_out.XXXXXX")
     local final_exit_code=0
     local has_real_changes=false
-    
-    # 步骤 1: 同步目录结构（使用 --omit-dir-times 避免更新目录时间戳）
-    rsync -d --recursive --no-owner --no-group --chmod=D755 \
-          --modify-window=2 --omit-dir-times \
-          -e "ssh -p $SSH_PORT" --rsync-path="$WIN_RSYNC_PATH" \
-          "${RSYNC_EXCLUDES[@]}" "$SSH_USER@$SSH_HOST:$win_cygdrive_path/" "$linux_dir/" > "$rsync_output_file" 2>&1
-    
-    # 步骤 2: 更新已存在文件（保护权限，使用 --update 和 --omit-dir-times）
-    rsync -rtzi --update --existing --no-owner --no-group --no-perms \
-          --modify-window=2 --omit-dir-times \
-          -e "ssh -p $SSH_PORT" --rsync-path="$WIN_RSYNC_PATH" \
-          "${RSYNC_EXCLUDES[@]}" "$SSH_USER@$SSH_HOST:$win_cygdrive_path/" "$linux_dir/" >> "$rsync_output_file" 2>&1
-    local exit_code_step1=$?
-    
-    # 检查是否有实际文件变化
+    local attempt exit_code delay
+
+    # 步骤 1: 同步目录结构
+    attempt=1
+    while [ $attempt -le $RETRY_MAX ]; do
+        rsync -d --recursive --no-owner --no-group --chmod=D755 \
+              --modify-window=2 --omit-dir-times \
+              -e "ssh $SSH_OPTS" --rsync-path="$WIN_RSYNC_PATH" \
+              "${RSYNC_EXCLUDES[@]}" "$SSH_USER@$SSH_HOST:$win_cygdrive_path/" "$linux_dir/" > "$rsync_output_file" 2>&1
+        exit_code=$?
+        if [ $exit_code -eq 12 ] && [ $attempt -lt $RETRY_MAX ]; then
+            delay=$((1 + RANDOM % 4))
+            log "$project_name" "INFO" "W→L 目录同步 socket 错误 [代码 12]，${attempt}/${RETRY_MAX} 次重试，等待 ${delay} 秒..."
+            sleep "$delay"
+            ((attempt++))
+            continue
+        fi
+        break
+    done
+    if [ $exit_code -ne 0 ] && [ $exit_code -ne 24 ]; then
+        final_exit_code=$exit_code
+    fi
+
+    # 步骤 2: 更新已存在文件（保护权限）
+    attempt=1
+    while [ $attempt -le $RETRY_MAX ]; do
+        rsync -rtzi --update --existing --no-owner --no-group --no-perms \
+              --modify-window=2 --omit-dir-times \
+              -e "ssh $SSH_OPTS" --rsync-path="$WIN_RSYNC_PATH" \
+              "${RSYNC_EXCLUDES[@]}" "$SSH_USER@$SSH_HOST:$win_cygdrive_path/" "$linux_dir/" >> "$rsync_output_file" 2>&1
+        exit_code=$?
+        if [ $exit_code -eq 12 ] && [ $attempt -lt $RETRY_MAX ]; then
+            delay=$((1 + RANDOM % 4))
+            log "$project_name" "INFO" "W→L 更新文件 socket 错误 [代码 12]，${attempt}/${RETRY_MAX} 次重试，等待 ${delay} 秒..."
+            sleep "$delay"
+            ((attempt++))
+            continue
+        fi
+        break
+    done
+
     if grep -E "^>f" "$rsync_output_file" > /dev/null 2>&1; then
         has_real_changes=true
     fi
-    
-    if [ $exit_code_step1 -ne 0 ] && [ $exit_code_step1 -ne 24 ]; then 
-        final_exit_code=$exit_code_step1
+
+    if [ $exit_code -ne 0 ] && [ $exit_code -ne 24 ]; then
+        final_exit_code=$exit_code
     fi
-    
+
     # 步骤 3: 新增文件（设置权限）
-    rsync -rtzl --ignore-existing --chmod=D755,F644 \
-          --modify-window=2 --omit-dir-times \
-          -e "ssh -p $SSH_PORT" --rsync-path="$WIN_RSYNC_PATH" \
-          "${RSYNC_EXCLUDES[@]}" "$SSH_USER@$SSH_HOST:$win_cygdrive_path/" "$linux_dir/" >> "$rsync_output_file" 2>&1
-    local exit_code_step2=$?
-    
-    # 检查是否有新文件
+    attempt=1
+    while [ $attempt -le $RETRY_MAX ]; do
+        rsync -rtzl --ignore-existing --chmod=D755,F644 \
+              --modify-window=2 --omit-dir-times \
+              -e "ssh $SSH_OPTS" --rsync-path="$WIN_RSYNC_PATH" \
+              "${RSYNC_EXCLUDES[@]}" "$SSH_USER@$SSH_HOST:$win_cygdrive_path/" "$linux_dir/" >> "$rsync_output_file" 2>&1
+        exit_code=$?
+        if [ $exit_code -eq 12 ] && [ $attempt -lt $RETRY_MAX ]; then
+            delay=$((1 + RANDOM % 4))
+            log "$project_name" "INFO" "W→L 新增文件 socket 错误 [代码 12]，${attempt}/${RETRY_MAX} 次重试，等待 ${delay} 秒..."
+            sleep "$delay"
+            ((attempt++))
+            continue
+        fi
+        break
+    done
+
     if grep -E "^>f\+\+\+\+\+\+\+\+\+" "$rsync_output_file" > /dev/null 2>&1; then
         has_real_changes=true
     fi
-    
-    if [ $exit_code_step2 -ne 0 ] && [ $exit_code_step2 -ne 24 ]; then 
-        final_exit_code=$exit_code_step2
+
+    if [ $exit_code -ne 0 ] && [ $exit_code -ne 24 ]; then
+        final_exit_code=$exit_code
     fi
-    
+
     # 步骤 4: 删除多余文件
-    rsync -rd --delete --existing --ignore-non-existing --no-owner --no-group --no-perms \
-          --modify-window=2 --omit-dir-times \
-          -e "ssh -p $SSH_PORT" --rsync-path="$WIN_RSYNC_PATH" \
-          "${RSYNC_EXCLUDES[@]}" "$SSH_USER@$SSH_HOST:$win_cygdrive_path/" "$linux_dir/" >> "$rsync_output_file" 2>&1
-    local exit_code_step3=$?
-    
-    # 检查是否有删除
+    attempt=1
+    while [ $attempt -le $RETRY_MAX ]; do
+        rsync -rd --delete --existing --ignore-non-existing --no-owner --no-group --no-perms \
+              --modify-window=2 --omit-dir-times \
+              -e "ssh $SSH_OPTS" --rsync-path="$WIN_RSYNC_PATH" \
+              "${RSYNC_EXCLUDES[@]}" "$SSH_USER@$SSH_HOST:$win_cygdrive_path/" "$linux_dir/" >> "$rsync_output_file" 2>&1
+        exit_code=$?
+        if [ $exit_code -eq 12 ] && [ $attempt -lt $RETRY_MAX ]; then
+            delay=$((1 + RANDOM % 4))
+            log "$project_name" "INFO" "W→L 删除文件 socket 错误 [代码 12]，${attempt}/${RETRY_MAX} 次重试，等待 ${delay} 秒..."
+            sleep "$delay"
+            ((attempt++))
+            continue
+        fi
+        break
+    done
+
     if grep -E "^\*deleting" "$rsync_output_file" > /dev/null 2>&1; then
         has_real_changes=true
     fi
-    
-    if [ $exit_code_step3 -ne 0 ] && [ $exit_code_step3 -ne 24 ]; then 
-        final_exit_code=$exit_code_step3
+
+    if [ $exit_code -ne 0 ] && [ $exit_code -ne 24 ]; then
+        final_exit_code=$exit_code
     fi
-    
+
     # 只有实际有文件变化时才输出日志
     if [ "$has_real_changes" = true ] && [ -s "$rsync_output_file" ]; then
         log "$project_name" "SYNC_DETAIL" "--- rsync 综合输出 (W→L) ---"
-        # 过滤掉只有时间戳变化的目录
         grep -v "^\.d\.\.t\.\.\.\.\.\." "$rsync_output_file" | sed 's/^/    /g' | tee -a "$LOG_FILE" > /dev/null
         log "$project_name" "SYNC_DETAIL" "--- 结束输出 ---"
     fi
-    
+
     rm -f "$rsync_output_file"
-    
+
     if [ $final_exit_code -eq 0 ] || [ $final_exit_code -eq 24 ]; then
         if [ "$has_real_changes" = true ]; then
             record_sync "$project_name" "W2L"
@@ -474,13 +518,13 @@ monitor_windows_changes() {
         local temp_output
         temp_output=$(rsync -rtin --delete --no-owner --no-group --no-perms \
                      --modify-window=2 \
-                     -e "ssh -p $SSH_PORT" --rsync-path="$WIN_RSYNC_PATH" \
+                     -e "ssh $SSH_OPTS" --rsync-path="$WIN_RSYNC_PATH" \
                      "${RSYNC_EXCLUDES[@]}" "$SSH_USER@$SSH_HOST:$win_cygdrive_path/" "$linux_dir/" 2>&1)
         local exit_code=$?
         
         # 如果有输出且不是错误，说明有变化
         if [ $exit_code -eq 0 ] || [ $exit_code -eq 24 ]; then
-            if echo "$temp_output" | grep -E "^[><cfhpguax\*]" > /dev/null 2>&1; then
+            if echo "$temp_output" | grep -E "^[><cfhpguax*]" > /dev/null 2>&1; then
                 echo | tee -a "$LOG_FILE"
                 log "$project_name" "EVENT" "检测到 Windows 变化"
                 if acquire_lock "$project_name" "$lock_file" "Sync from Windows"; then
