@@ -11,8 +11,10 @@
 SYNC_MODE=unidirectional
 
 # --- 全局配置 (所有项目共享) ---
-SSH_USER="amei"
-SSH_HOST="192.168.1.3"
+# SSH_USER="amei"
+# SSH_HOST="192.168.1.3"
+SSH_USER="Administrator"
+SSH_HOST="192.168.1.9"
 SSH_PORT="22"
 WIN_RSYNC_PATH="\"D:/Program Files (x86)/cwRsync/bin/rsync.exe\"" # 注意引号的使用
 SSH_OPTS="-p $SSH_PORT -o ControlMaster=auto -o ControlPath=/tmp/ssh_mux_%r@%h:%p -o ControlPersist=60"
