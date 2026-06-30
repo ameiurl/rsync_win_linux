@@ -17,7 +17,6 @@ SSH_USER="Administrator"
 SSH_HOST="192.168.1.9"
 SSH_PORT="22"
 WIN_RSYNC_PATH="\"D:/Program Files (x86)/cwRsync/bin/rsync.exe\"" # 注意引号的使用
-SSH_OPTS="-p $SSH_PORT -o ControlMaster=auto -o ControlPath=/tmp/ssh_mux_%r@%h:%p -o ControlPersist=60"
 RETRY_MAX=10
 LOG_FILE="/home/amei/multi_sync.log"
 PID_FILE="/tmp/multi_sync.pid"
@@ -240,7 +239,7 @@ sync_linux_to_win() {
         # 使用 --update 和 --omit-dir-times 避免不必要的目录时间戳更新
         rsync -avzi --update --no-owner --no-group --delete \
               --modify-window=2 --omit-dir-times \
-              -e "ssh $SSH_OPTS" --rsync-path="$WIN_RSYNC_PATH" \
+              -e "ssh -p $SSH_PORT" --rsync-path="$WIN_RSYNC_PATH" \
               "${RSYNC_EXCLUDES[@]}" "$linux_dir/" "$SSH_USER@$SSH_HOST:$win_cygdrive_path/" > "$rsync_output_file" 2>&1
         exit_code=$?
 
@@ -297,7 +296,7 @@ sync_win_to_linux() {
     while [ $attempt -le $RETRY_MAX ]; do
         rsync -d --recursive --no-owner --no-group --chmod=D755 \
               --modify-window=2 --omit-dir-times \
-              -e "ssh $SSH_OPTS" --rsync-path="$WIN_RSYNC_PATH" \
+              -e "ssh -p $SSH_PORT" --rsync-path="$WIN_RSYNC_PATH" \
               "${RSYNC_EXCLUDES[@]}" "$SSH_USER@$SSH_HOST:$win_cygdrive_path/" "$linux_dir/" > "$rsync_output_file" 2>&1
         exit_code=$?
         if [ $exit_code -eq 12 ] && [ $attempt -lt $RETRY_MAX ]; then
@@ -318,7 +317,7 @@ sync_win_to_linux() {
     while [ $attempt -le $RETRY_MAX ]; do
         rsync -rtzi --update --existing --no-owner --no-group --no-perms \
               --modify-window=2 --omit-dir-times \
-              -e "ssh $SSH_OPTS" --rsync-path="$WIN_RSYNC_PATH" \
+              -e "ssh -p $SSH_PORT" --rsync-path="$WIN_RSYNC_PATH" \
               "${RSYNC_EXCLUDES[@]}" "$SSH_USER@$SSH_HOST:$win_cygdrive_path/" "$linux_dir/" >> "$rsync_output_file" 2>&1
         exit_code=$?
         if [ $exit_code -eq 12 ] && [ $attempt -lt $RETRY_MAX ]; then
@@ -344,7 +343,7 @@ sync_win_to_linux() {
     while [ $attempt -le $RETRY_MAX ]; do
         rsync -rtzl --ignore-existing --chmod=D755,F644 \
               --modify-window=2 --omit-dir-times \
-              -e "ssh $SSH_OPTS" --rsync-path="$WIN_RSYNC_PATH" \
+              -e "ssh -p $SSH_PORT" --rsync-path="$WIN_RSYNC_PATH" \
               "${RSYNC_EXCLUDES[@]}" "$SSH_USER@$SSH_HOST:$win_cygdrive_path/" "$linux_dir/" >> "$rsync_output_file" 2>&1
         exit_code=$?
         if [ $exit_code -eq 12 ] && [ $attempt -lt $RETRY_MAX ]; then
@@ -370,7 +369,7 @@ sync_win_to_linux() {
     while [ $attempt -le $RETRY_MAX ]; do
         rsync -rd --delete --existing --ignore-non-existing --no-owner --no-group --no-perms \
               --modify-window=2 --omit-dir-times \
-              -e "ssh $SSH_OPTS" --rsync-path="$WIN_RSYNC_PATH" \
+              -e "ssh -p $SSH_PORT" --rsync-path="$WIN_RSYNC_PATH" \
               "${RSYNC_EXCLUDES[@]}" "$SSH_USER@$SSH_HOST:$win_cygdrive_path/" "$linux_dir/" >> "$rsync_output_file" 2>&1
         exit_code=$?
         if [ $exit_code -eq 12 ] && [ $attempt -lt $RETRY_MAX ]; then
@@ -520,7 +519,7 @@ monitor_windows_changes() {
         local temp_output
         temp_output=$(rsync -rtin --delete --no-owner --no-group --no-perms \
                      --modify-window=2 \
-                     -e "ssh $SSH_OPTS" --rsync-path="$WIN_RSYNC_PATH" \
+                     -e "ssh -p $SSH_PORT" --rsync-path="$WIN_RSYNC_PATH" \
                      "${RSYNC_EXCLUDES[@]}" "$SSH_USER@$SSH_HOST:$win_cygdrive_path/" "$linux_dir/" 2>&1)
         local exit_code=$?
         
