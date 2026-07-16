@@ -106,11 +106,10 @@ run_rsync() {
     local label="$1" output_file="$2"; shift 2
     local attempt=1 delay exit_code
 
+    acquire_global_lock "$label"
     while [ $attempt -le $RETRY_MAX ]; do
-        acquire_global_lock "$label"
         rsync "$@" > "$output_file" 2>&1
         exit_code=$?
-        release_global_lock
 
         if { [ $exit_code -eq 12 ] || [ $exit_code -eq 23 ] || [ $exit_code -eq 11 ]; } && [ $attempt -lt $RETRY_MAX ]; then
             delay=$((1 + RANDOM % 4))
@@ -121,6 +120,7 @@ run_rsync() {
         fi
         break
     done
+    release_global_lock
     return $exit_code
 }
 
@@ -203,11 +203,10 @@ sync_win_to_linux() {
     local tmp=$(mktemp "/tmp/rsync_w2l_${proj}.XXXXXX")
     local rc=0
 
-    # 单步 rsync：合并原来的 4 步为 1 步
-    # --no-perms 保护 Linux 权限不被 Windows 覆盖
-    # --delete-during 增量删除
+    # W→L: 只新增和更新，不删除（避免竞态删除 Linux 新创建的文件/目录）
+    # 删除统一由 L→W 方向的 --delete-during 控制
     run_rsync "$proj" "$tmp" \
-        -rtzi --update --delete-during --no-owner --no-group --no-perms \
+        -rtzi --update --no-owner --no-group --no-perms \
         --modify-window=2 --omit-dir-times \
         -e "ssh -p $SSH_PORT" --rsync-path="$WIN_RSYNC_PATH" \
         "${RSYNC_EXCLUDES[@]}" \
@@ -251,9 +250,6 @@ linux_watcher() {
         --excludei "$INOTIFY_EXCLUDE_PATTERN" \
         --format '%w%f' "$ldir" 2>/dev/null | \
     while IFS= read -r file; do
-        # 跳过纯目录事件
-        [ -d "$file" ] && continue
-
         # 检查上次同步是否已完成
         if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
             pid=""
@@ -302,7 +298,7 @@ windows_watcher() {
 
         # dry-run 检测变化
         local changes
-        changes=$(rsync -rtin --delete --no-owner --no-group --no-perms \
+        changes=$(rsync -rtin --no-owner --no-group --no-perms \
             --modify-window=2 \
             -e "ssh -p $SSH_PORT" --rsync-path="$WIN_RSYNC_PATH" \
             "${RSYNC_EXCLUDES[@]}" \
@@ -317,7 +313,7 @@ windows_watcher() {
         while true; do
             sync_win_to_linux "$proj" "$ldir" "$wdir" || break
 
-            changes=$(rsync -rtin --delete --no-owner --no-group --no-perms \
+            changes=$(rsync -rtin --no-owner --no-group --no-perms \
                 --modify-window=2 \
                 -e "ssh -p $SSH_PORT" --rsync-path="$WIN_RSYNC_PATH" \
                 "${RSYNC_EXCLUDES[@]}" \
