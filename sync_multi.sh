@@ -8,8 +8,10 @@
 # ============================================================================
 SYNC_MODE="bidirectional"   # bidirectional | unidirectional
 
-SSH_USER="Administrator"
-SSH_HOST="192.168.1.9"
+# SSH_USER="Administrator"
+# SSH_HOST="192.168.1.9"
+SSH_USER="amei"
+SSH_HOST="192.168.1.3"
 SSH_PORT="22"
 WIN_RSYNC_PATH="\"D:/Program Files (x86)/cwRsync/bin/rsync.exe\""
 
@@ -307,6 +309,18 @@ windows_watcher() {
         [ "$changes" -eq 0 ] && continue
 
         log "$proj" "EVENT" "检测到 Windows 变化 ($changes 项)"
+
+        # 等待 3 秒后重新确认，避免与 inotify 触发的 L→W 同步竞态
+        # 场景：Linux 删除了文件，inotify 还没执行 L→W，但轮询先检测到了差异
+        # 如果不等待，W→L 会把 Windows 上尚未被删除的文件复制回 Linux
+        sleep 3
+        changes=$(rsync -rtin --no-owner --no-group --no-perms \
+            --modify-window=2 \
+            -e "ssh -p $SSH_PORT" --rsync-path="$WIN_RSYNC_PATH" \
+            "${RSYNC_EXCLUDES[@]}" \
+            "$(ssh_dest):$wdir/" "$ldir/" 2>/dev/null | grep -E '^[><cfhpguax*]' | wc -l)
+
+        [ "$changes" -eq 0 ] && { log "$proj" "OK" "变化已由 L→W 处理, 跳过 W→L"; continue; }
 
         # 循环直到干净：处理同步期间的新变更
         local loop=0
