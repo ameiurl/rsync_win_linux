@@ -170,7 +170,7 @@ sync_linux_to_win() {
     local rc=0
 
     run_rsync "$proj" "$tmp" \
-        -rtzi --update --delete-during --no-owner --no-group \
+        -avzi --update --delete --no-owner --no-group \
         --modify-window=2 --omit-dir-times \
         -e "ssh -p $SSH_PORT" --rsync-path="$WIN_RSYNC_PATH" \
         "${RSYNC_EXCLUDES[@]}" \
@@ -181,10 +181,20 @@ sync_linux_to_win() {
         local changes=$(grep -E '^[><cfhpguax*]' "$tmp" 2>/dev/null | wc -l)
         if [ "$changes" -gt 0 ]; then
             log "$proj" "SYNC" "L→W: ${changes} 个文件变更"
-            grep -E '^[><cfhpguax*]' "$tmp" | head -3 | while IFS= read -r l; do
-                log "$proj" "SYNC" "  $l"
-            done
+            if [ "$changes" -le 20 ]; then
+                grep -E '^[><cfhpguax*]' "$tmp" | while IFS= read -r l; do
+                    log "$proj" "SYNC" "  $l"
+                done
+            else
+                log "$proj" "SYNC" "  (前5条) ..."
+                grep -E '^[><cfhpguax*]' "$tmp" | head -5 | while IFS= read -r l; do
+                    log "$proj" "SYNC" "  $l"
+                done
+            fi
             record_sync "$proj" "L2W"   # 仅实际有变更时记录时间戳
+            # L→W 完成后，inotify 侧 3 秒内忽略所有事件
+            # 防止 rsync 在 Windows 端写入文件后引发 inotify 回音
+            is_bidirectional && echo $(($(date +%s) + 3)) > "$STATE_DIR/$proj/ignore_until"
         fi
     else
         log "$proj" "ERROR" "L→W 失败 (exit=$rc)"
@@ -206,7 +216,7 @@ sync_win_to_linux() {
     local rc=0
 
     # W→L: 只新增和更新，不删除（避免竞态删除 Linux 新创建的文件/目录）
-    # 删除统一由 L→W 方向的 --delete-during 控制
+    # 删除统一由 L→W 方向的 --delete 控制
     run_rsync "$proj" "$tmp" \
         -rtzi --update --no-owner --no-group --no-perms \
         --modify-window=2 --omit-dir-times \
@@ -219,9 +229,16 @@ sync_win_to_linux() {
         local changes=$(grep -E '^[><cfhpguax*]' "$tmp" 2>/dev/null | wc -l)
         if [ "$changes" -gt 0 ]; then
             log "$proj" "SYNC" "W→L: ${changes} 个文件变更"
-            grep -E '^[><cfhpguax*]' "$tmp" | head -3 | while IFS= read -r l; do
-                log "$proj" "SYNC" "  $l"
-            done
+            if [ "$changes" -le 20 ]; then
+                grep -E '^[><cfhpguax*]' "$tmp" | while IFS= read -r l; do
+                    log "$proj" "SYNC" "  $l"
+                done
+            else
+                log "$proj" "SYNC" "  (前5条) ..."
+                grep -E '^[><cfhpguax*]' "$tmp" | head -5 | while IFS= read -r l; do
+                    log "$proj" "SYNC" "  $l"
+                done
+            fi
             record_sync "$proj" "W2L"
         fi
     else
@@ -250,8 +267,23 @@ linux_watcher() {
     inotifywait -m -q -r \
         -e CREATE,CLOSE_WRITE,DELETE,MODIFY,MOVED_FROM,MOVED_TO \
         --excludei "$INOTIFY_EXCLUDE_PATTERN" \
-        --format '%w%f' "$ldir" 2>/dev/null | \
-    while IFS= read -r file; do
+        --format '%e|%w%f' "$ldir" 2>/dev/null | \
+    while IFS='|' read -r events file; do
+        # 过滤目录 MODIFY 事件（文件修改导致的目录 mtime 更新是噪音）
+        # DELETE,ISDIR / CREATE,ISDIR / MOVE 事件必须保留，否则目录增删无法同步
+        [[ "$events" =~ MODIFY ]] && [[ "$events" =~ ISDIR ]] && continue
+
+        # 双向模式下检查是否在忽略时间窗口内（L→W 完成后 5s 内忽略所有事件）
+        local ignore_file="$STATE_DIR/$proj/ignore_until"
+        if is_bidirectional && [ -f "$ignore_file" ]; then
+            local ignore_until=$(cat "$ignore_file")
+            local now=$(date +%s)
+            if [ "$now" -lt "$ignore_until" ]; then
+                continue  # 窗口内，直接丢弃事件
+            fi
+            rm -f "$ignore_file"  # 窗口已过期，清理
+        fi
+
         # 检查上次同步是否已完成
         if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
             pid=""
@@ -266,8 +298,11 @@ linux_watcher() {
                     echo "ok" >&4
                     sync_linux_to_win "$proj" "$ldir" "$wdir"
                 done
+                # 写入完成时间戳，W→L 据此判断是否需要等待
+                date +%s > "$STATE_DIR/$proj/l2w_done"
             ) &
             pid=$!
+            echo "$pid" > "$STATE_DIR/$proj/l2w_pid"
             waiting=0
         else
             # 同步正在进行 → 通知后台进程"结束后再跑一次"
@@ -321,6 +356,30 @@ windows_watcher() {
             "$(ssh_dest):$wdir/" "$ldir/" 2>/dev/null | grep -E '^[><cfhpguax*]' | wc -l)
 
         [ "$changes" -eq 0 ] && { log "$proj" "OK" "变化已由 L→W 处理, 跳过 W→L"; continue; }
+
+        # 检查 L→W 是否仍在运行（或刚完成，可能马上要跑下一轮）
+        # 两种场景跳过 W→L：
+        #   1. l2w_pid 存活 → L→W 正运行
+        #   2. l2w_done < 3s  → L→W 刚跑完，inotify 事件可能正排队等下一轮
+        local l2w_pid_file="$STATE_DIR/$proj/l2w_pid"
+        local l2w_done_file="$STATE_DIR/$proj/l2w_done"
+        local skip_w2l=false
+        if [ -f "$l2w_pid_file" ]; then
+            local l2w_pid=$(cat "$l2w_pid_file" 2>/dev/null)
+            if [ -n "$l2w_pid" ] && kill -0 "$l2w_pid" 2>/dev/null; then
+                log "$proj" "OK" "L→W 仍在运行 (PID $l2w_pid), 跳过 W→L"
+                skip_w2l=true
+            fi
+        fi
+        if ! $skip_w2l && [ -f "$l2w_done_file" ]; then
+            local l2w_done=$(cat "$l2w_done_file" 2>/dev/null)
+            local now=$(date +%s)
+            if [ -n "$l2w_done" ] && [ $((now - l2w_done)) -lt 3 ]; then
+                log "$proj" "OK" "L→W 刚完成 ($((now - l2w_done))s 前), 跳过 W→L"
+                skip_w2l=true
+            fi
+        fi
+        $skip_w2l && continue
 
         # 循环直到干净：处理同步期间的新变更
         local loop=0
