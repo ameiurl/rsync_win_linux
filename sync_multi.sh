@@ -8,10 +8,10 @@
 # ============================================================================
 SYNC_MODE="bidirectional"   # bidirectional | unidirectional
 
-# SSH_USER="Administrator"
-# SSH_HOST="192.168.1.9"
-SSH_USER="amei"
-SSH_HOST="192.168.1.3"
+SSH_USER="Administrator"
+SSH_HOST="192.168.1.9"
+# SSH_USER="amei"
+# SSH_HOST="192.168.1.3"
 SSH_PORT="22"
 WIN_RSYNC_PATH="\"D:/Program Files (x86)/cwRsync/bin/rsync.exe\""
 
@@ -88,8 +88,9 @@ ssh_dest() { echo "${SSH_USER}@${SSH_HOST}"; }
 GLOBAL_LOCK="/tmp/rsync_global.lock"
 
 acquire_global_lock() {
+    local holder
     while ! (set -o noclobber; echo "$$" > "$GLOBAL_LOCK") 2>/dev/null; do
-        local holder=$(cat "$GLOBAL_LOCK" 2>/dev/null)
+        holder=$(cat "$GLOBAL_LOCK" 2>/dev/null)
         if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
             rm -f "$GLOBAL_LOCK"  # 死锁清理
         fi
@@ -268,16 +269,17 @@ linux_watcher() {
         -e CREATE,CLOSE_WRITE,DELETE,MODIFY,MOVED_FROM,MOVED_TO \
         --excludei "$INOTIFY_EXCLUDE_PATTERN" \
         --format '%e|%w%f' "$ldir" 2>/dev/null | \
+    local ignore_file ignore_until now
     while IFS='|' read -r events file; do
         # 过滤目录 MODIFY 事件（文件修改导致的目录 mtime 更新是噪音）
         # DELETE,ISDIR / CREATE,ISDIR / MOVE 事件必须保留，否则目录增删无法同步
         [[ "$events" =~ MODIFY ]] && [[ "$events" =~ ISDIR ]] && continue
 
         # 双向模式下检查是否在忽略时间窗口内（L→W 完成后 5s 内忽略所有事件）
-        local ignore_file="$STATE_DIR/$proj/ignore_until"
+        ignore_file="$STATE_DIR/$proj/ignore_until"
         if is_bidirectional && [ -f "$ignore_file" ]; then
-            local ignore_until=$(cat "$ignore_file")
-            local now=$(date +%s)
+            ignore_until=$(cat "$ignore_file")
+            now=$(date +%s)
             if [ "$now" -lt "$ignore_until" ]; then
                 continue  # 窗口内，直接丢弃事件
             fi
