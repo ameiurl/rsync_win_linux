@@ -265,11 +265,11 @@ linux_watcher() {
     # 退出时清理 FIFO
     trap "exec 3>&-; exec 4>&-; rm -f '$run_pipe' '$result_pipe'" EXIT
 
+    local ignore_file ignore_until now
     inotifywait -m -q -r \
         -e CREATE,CLOSE_WRITE,DELETE,MODIFY,MOVED_FROM,MOVED_TO \
         --excludei "$INOTIFY_EXCLUDE_PATTERN" \
         --format '%e|%w%f' "$ldir" 2>/dev/null | \
-    local ignore_file ignore_until now
     while IFS='|' read -r events file; do
         # 过滤目录 MODIFY 事件（文件修改导致的目录 mtime 更新是噪音）
         # DELETE,ISDIR / CREATE,ISDIR / MOVE 事件必须保留，否则目录增删无法同步
