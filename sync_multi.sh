@@ -8,10 +8,8 @@
 # ============================================================================
 SYNC_MODE="bidirectional"   # bidirectional | unidirectional
 
-SSH_USER="Administrator"
-SSH_HOST="192.168.1.9"
-# SSH_USER="amei"
-# SSH_HOST="192.168.1.3"
+SSH_USER="amei"
+SSH_HOST="192.168.1.10"
 SSH_PORT="22"
 WIN_RSYNC_PATH="\"D:/Program Files (x86)/cwRsync/bin/rsync.exe\""
 
