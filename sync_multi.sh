@@ -1,7 +1,31 @@
 #!/bin/bash
 # 基于 syncd 架构的多项目双向实时同步脚本
 # 采用 FIFO 事件聚合模式，同步期间变更不丢失
-# 版本: 6.0
+# 版本: 6.1
+#
+# v6.1 变更:
+#   - 修复: L→W 的 --delete 在 Windows 有新变更未回传时会误删 Windows 文件
+#     (新增 windows_dirty 保护锁: 轮询器检测到 Windows 变更即挂锁禁用 --delete,
+#      仅当轮询器确认 Windows 干净后解除, 失败/中断期间保持锁以保护数据)
+#   - 修复: L→W 后的 3s ignore_until 窗口会丢弃真实 Linux 编辑事件 (已移除该机制,
+#     回音防护由 should_skip 10s 窗口承担)
+#   - 修复: 轮询 dry-run 方向不敏感, 会把 Linux 侧变更误当 Windows 变更,
+#     造成徒劳循环并掩盖 inotify 丢事件 (dry-run 增加 --update, 只检测 Windows 更新)
+#   - 修复: inotify 排除正则锚定失效 (^config/... 与 ^~$.* 对绝对路径永不匹配)
+#   - 修复: 轮询 dry-run 绕过全局锁 (cwRsync 并发连接 error 12 隐患)
+#   - 修复: 同步子进程僵尸累积 (watcher 检测到退出后 wait 收割)
+#   - 修复: 临时文件清理 glob /tmp/rsync_*_*.XXXXXX 永不匹配 (泄漏)
+#   - 优化: FIFO 聚合改为 drain 模式, 一个事件突发只补跑一轮全量同步
+#   - 优化: ssh 增加 ConnectTimeout/BatchMode/ServerAliveInterval,
+#     rsync 增加 --timeout, 防止 Windows 离线时挂死并拖死全局锁
+#   - 优化: 日志文件按大小轮转, 文件内不再写入 ANSI 颜色码
+#
+# 已知设计约束 (有意为之):
+#   - Windows 上的删除不会传播到 Linux (W→L 无 --delete, 避免竞态删文件);
+#     Linux 为删除权威端. 若 Windows 上误删, 下次 L→W 会复制回来.
+#   - L→W 的 --delete 仍存在 ≤1 个轮询周期(5s)的误删窗口: Windows 新建文件后、
+#     轮询尚未检测到之前, 若恰好发生 Linux 事件触发 L→W, 该文件可能被删.
+#     如需彻底消除, 可把轮询间隔调小, 或 L→W 前先做一次 W→L dry-run 确认干净.
 
 # ============================================================================
 # 配置
@@ -11,10 +35,13 @@ SYNC_MODE="bidirectional"   # bidirectional | unidirectional
 SSH_USER="amei"
 SSH_HOST="192.168.1.10"
 SSH_PORT="22"
+# 远程 ssh 选项: 防止 Windows 离线/睡眠时 ssh 长时间挂起
+SSH_OPTS="-o ConnectTimeout=5 -o BatchMode=yes -o ServerAliveInterval=15"
 WIN_RSYNC_PATH="\"D:/Program Files (x86)/cwRsync/bin/rsync.exe\""
 
 RETRY_MAX=10
 LOG_FILE="/home/amei/multi_sync.log"
+LOG_MAX_SIZE=10485760        # 10MB, 超出后轮转为 .1
 PID_FILE="/tmp/multi_sync.pid"
 STATE_DIR="/tmp/sync_state"
 
@@ -32,7 +59,8 @@ RSYNC_EXCLUDES=(
     "--exclude=*.log" "--exclude=*.tmp" "--exclude=*.swp" "--exclude=*.zip" "--exclude=~$*"
 )
 
-INOTIFY_EXCLUDE_PATTERN='(\.git/|\.svn/|\.idea/|\.vscode/|node_modules/|runtime/|unpackage/|cache/|^config/database\.local\.php$|\.bak$|\.env$|\.log$|\.tmp$|\.swp$|^~\$.*)'
+# 注意: inotifywait 用完整绝对路径匹配正则, 锚定模式必须允许路径前缀
+INOTIFY_EXCLUDE_PATTERN='(\.git/|\.svn/|\.idea/|\.vscode/|node_modules/|runtime/|unpackage/|cache/|(^|/)config/database\.local\.php$|\.bak$|\.env(\.development)?$|\.log$|\.tmp$|\.swp$|(^|/)~\$.*)'
 
 # ============================================================================
 # 初始化
@@ -65,7 +93,18 @@ log() {
         WARN)   color='\033[0;33m'; sym="⚠️"  ;;
         *)      color='\033[0;90m'; sym="ℹ️"  ;;
     esac
-    echo -e "[$ts] ${color}${sym} [${proj}]${color} ${msg}\033[0m" | tee -a "$LOG_FILE"
+    # 日志轮转
+    if [ -f "$LOG_FILE" ]; then
+        local sz=$(stat -c %s "$LOG_FILE" 2>/dev/null || echo 0)
+        if [ "${sz:-0}" -gt "$LOG_MAX_SIZE" ]; then
+            mv -f "$LOG_FILE" "$LOG_FILE.1" 2>/dev/null || true
+            : > "$LOG_FILE"
+            echo "[$ts] ℹ️ [MAIN] 日志已轮转 (>${LOG_MAX_SIZE}B)" >> "$LOG_FILE"
+        fi
+    fi
+    # 终端带颜色, 文件只写纯文本
+    printf "[%s] ${color}%s [%s]${color} %s\033[0m\n" "$ts" "$sym" "$proj" "$msg"
+    printf "[%s] %s [%s] %s\n" "$ts" "$sym" "$proj" "$msg" >> "$LOG_FILE"
 }
 
 is_bidirectional() { [[ "$SYNC_MODE" == "bidirectional" ]]; }
@@ -125,6 +164,30 @@ run_rsync() {
     return $exit_code
 }
 
+# 统计并记录 itemized 变更；stdout 返回变更数
+report_changes() {
+    local proj="$1" direction="$2" tmp="$3"
+    local changes show
+    changes=$(grep -E '^[><cfhpguax*]' "$tmp" 2>/dev/null | wc -l)
+    [ "$changes" -gt 0 ] || { echo 0; return; }
+    log "$proj" "SYNC" "$direction: ${changes} 个文件变更"
+    show=20
+    [ "$changes" -gt 20 ] && show=5
+    grep -E '^[><cfhpguax*]' "$tmp" 2>/dev/null | head -n "$show" | while IFS= read -r l; do
+        log "$proj" "SYNC" "  $l"
+    done
+    [ "$changes" -gt 20 ] && log "$proj" "SYNC" "  (仅显示前5条, 共${changes}条)"
+    echo "$changes"
+}
+
+log_rsync_failure() {
+    local proj="$1" direction="$2" rc="$3" tmp="$4"
+    log "$proj" "ERROR" "$direction 失败 (exit=$rc)"
+    tail -n 3 "$tmp" 2>/dev/null | while IFS= read -r l; do
+        [ -n "$l" ] && log "$proj" "ERROR" "  $l"
+    done
+}
+
 # ============================================================================
 # 状态追踪（防回环，仅双向模式）
 # ============================================================================
@@ -155,6 +218,45 @@ should_skip() {
 }
 
 # ============================================================================
+# 带全局锁的 W→L dry-run: 只统计 Windows 侧更新的变更
+# (--update 过滤掉"Linux 比 Windows 新"的文件, 那些由 inotify 触发的 L→W 负责,
+#  避免方向混淆: 否则 Linux 侧变更会触发徒劳的 W→L 循环)
+# ============================================================================
+dryrun_w2l_changes() {
+    local proj="$1" ldir="$2" wdir="$3"
+    local tmp rc changes
+    tmp=$(mktemp "/tmp/rsync_dry_${proj}.XXXXXX")
+
+    acquire_global_lock
+    rsync -rtin --update --no-owner --no-group --no-perms \
+        --modify-window=2 --timeout=30 \
+        -e "ssh $SSH_OPTS -p $SSH_PORT" --rsync-path="$WIN_RSYNC_PATH" \
+        "${RSYNC_EXCLUDES[@]}" \
+        "$(ssh_dest):$wdir/" "$ldir/" > "$tmp" 2>&1
+    rc=$?
+    release_global_lock
+
+    changes=$(grep -E '^[><cfhpguax*]' "$tmp" 2>/dev/null | wc -l)
+    if [ $rc -ne 0 ] && [ $rc -ne 24 ]; then
+        # 失败时每 60s 只记一次, 避免 Windows 离线期间刷屏
+        local fail_ts_file="$STATE_DIR/$proj/dry_fail_ts"
+        local now=$(date +%s)
+        local last_fail=0
+        [ -f "$fail_ts_file" ] && last_fail=$(cat "$fail_ts_file" 2>/dev/null || echo 0)
+        if [ $((now - last_fail)) -gt 60 ]; then
+            log "$proj" "ERROR" "W→L dry-run 失败 (exit=$rc)"
+            tail -n 2 "$tmp" 2>/dev/null | while IFS= read -r l; do
+                [ -n "$l" ] && log "$proj" "ERROR" "  $l"
+            done
+            date +%s > "$fail_ts_file"
+        fi
+        changes=0
+    fi
+    rm -f "$tmp"
+    echo "$changes"
+}
+
+# ============================================================================
 # 核心同步函数
 # ============================================================================
 sync_linux_to_win() {
@@ -166,37 +268,31 @@ sync_linux_to_win() {
     fi
 
     local tmp=$(mktemp "/tmp/rsync_l2w_${proj}.XXXXXX")
-    local rc=0
+    local rc=0 changes
+
+    # 数据保护: Windows 侧有未回传变更时禁用 --delete,
+    # 防止误删 Windows 上新建/刚修改的文件 (见头部注释的竞态说明)
+    local del_args=()
+    if [ ! -f "$STATE_DIR/$proj/windows_dirty" ]; then
+        del_args=(--delete)
+    fi
 
     run_rsync "$proj" "$tmp" \
-        -avzi --update --delete --no-owner --no-group \
-        --modify-window=2 --omit-dir-times \
-        -e "ssh -p $SSH_PORT" --rsync-path="$WIN_RSYNC_PATH" \
+        -avzi --update "${del_args[@]}" \
+        --no-owner --no-group --no-perms --partial \
+        --modify-window=2 --omit-dir-times --timeout=30 \
+        -e "ssh $SSH_OPTS -p $SSH_PORT" --rsync-path="$WIN_RSYNC_PATH" \
         "${RSYNC_EXCLUDES[@]}" \
         "$ldir/" "$(ssh_dest):$wdir/"
     rc=$?
 
     if [ $rc -eq 0 ] || [ $rc -eq 24 ]; then
-        local changes=$(grep -E '^[><cfhpguax*]' "$tmp" 2>/dev/null | wc -l)
+        changes=$(report_changes "$proj" "L→W" "$tmp")
         if [ "$changes" -gt 0 ]; then
-            log "$proj" "SYNC" "L→W: ${changes} 个文件变更"
-            if [ "$changes" -le 20 ]; then
-                grep -E '^[><cfhpguax*]' "$tmp" | while IFS= read -r l; do
-                    log "$proj" "SYNC" "  $l"
-                done
-            else
-                log "$proj" "SYNC" "  (前5条) ..."
-                grep -E '^[><cfhpguax*]' "$tmp" | head -5 | while IFS= read -r l; do
-                    log "$proj" "SYNC" "  $l"
-                done
-            fi
             record_sync "$proj" "L2W"   # 仅实际有变更时记录时间戳
-            # L→W 完成后，inotify 侧 3 秒内忽略所有事件
-            # 防止 rsync 在 Windows 端写入文件后引发 inotify 回音
-            is_bidirectional && echo $(($(date +%s) + 3)) > "$STATE_DIR/$proj/ignore_until"
         fi
     else
-        log "$proj" "ERROR" "L→W 失败 (exit=$rc)"
+        log_rsync_failure "$proj" "L→W" "$rc" "$tmp"
     fi
     rm -f "$tmp"
     return $rc
@@ -212,36 +308,27 @@ sync_win_to_linux() {
     fi
 
     local tmp=$(mktemp "/tmp/rsync_w2l_${proj}.XXXXXX")
-    local rc=0
+    local rc=0 changes
 
     # W→L: 只新增和更新，不删除（避免竞态删除 Linux 新创建的文件/目录）
-    # 删除统一由 L→W 方向的 --delete 控制
+    # 删除统一由 L→W 方向的 --delete 控制（Linux 为权威端）
     run_rsync "$proj" "$tmp" \
-        -rtzi --update --no-owner --no-group --no-perms \
-        --modify-window=2 --omit-dir-times \
-        -e "ssh -p $SSH_PORT" --rsync-path="$WIN_RSYNC_PATH" \
+        -rtzi --update --no-owner --no-group --no-perms --partial \
+        --modify-window=2 --omit-dir-times --timeout=30 \
+        -e "ssh $SSH_OPTS -p $SSH_PORT" --rsync-path="$WIN_RSYNC_PATH" \
         "${RSYNC_EXCLUDES[@]}" \
         "$(ssh_dest):$wdir/" "$ldir/"
     rc=$?
 
     if [ $rc -eq 0 ] || [ $rc -eq 24 ]; then
-        local changes=$(grep -E '^[><cfhpguax*]' "$tmp" 2>/dev/null | wc -l)
+        changes=$(report_changes "$proj" "W→L" "$tmp")
         if [ "$changes" -gt 0 ]; then
-            log "$proj" "SYNC" "W→L: ${changes} 个文件变更"
-            if [ "$changes" -le 20 ]; then
-                grep -E '^[><cfhpguax*]' "$tmp" | while IFS= read -r l; do
-                    log "$proj" "SYNC" "  $l"
-                done
-            else
-                log "$proj" "SYNC" "  (前5条) ..."
-                grep -E '^[><cfhpguax*]' "$tmp" | head -5 | while IFS= read -r l; do
-                    log "$proj" "SYNC" "  $l"
-                done
-            fi
             record_sync "$proj" "W2L"
         fi
+        # 注意: windows_dirty 由轮询器统一管理 (干净确认后清除),
+        # 不在同步函数里清除, 避免 W→L 循环期间出现 --delete 暴露窗口
     else
-        log "$proj" "ERROR" "W→L 失败 (exit=$rc)"
+        log_rsync_failure "$proj" "W→L" "$rc" "$tmp"
     fi
     rm -f "$tmp"
     return $rc
@@ -254,7 +341,8 @@ linux_watcher() {
     local proj="$1" ldir="$2" wdir="$3"
     log "$proj" "INIT" "Linux 监控启动 (FIFO 聚合模式)"
 
-    local run_pipe result_pipe pid waiting
+    local run_pipe result_pipe pid
+    local waiting=0
     run_pipe=$(mktemp -u); mkfifo "$run_pipe"
     result_pipe=$(mktemp -u); mkfifo "$result_pipe"
     exec 3<>"$run_pipe"
@@ -263,7 +351,7 @@ linux_watcher() {
     # 退出时清理 FIFO
     trap "exec 3>&-; exec 4>&-; rm -f '$run_pipe' '$result_pipe'" EXIT
 
-    local ignore_file ignore_until now
+    # 注意: 管道右侧在子 shell 中运行, 不能用 local
     inotifywait -m -q -r \
         -e CREATE,CLOSE_WRITE,DELETE,MODIFY,MOVED_FROM,MOVED_TO \
         --excludei "$INOTIFY_EXCLUDE_PATTERN" \
@@ -273,19 +361,9 @@ linux_watcher() {
         # DELETE,ISDIR / CREATE,ISDIR / MOVE 事件必须保留，否则目录增删无法同步
         [[ "$events" =~ MODIFY ]] && [[ "$events" =~ ISDIR ]] && continue
 
-        # 双向模式下检查是否在忽略时间窗口内（L→W 完成后 5s 内忽略所有事件）
-        ignore_file="$STATE_DIR/$proj/ignore_until"
-        if is_bidirectional && [ -f "$ignore_file" ]; then
-            ignore_until=$(cat "$ignore_file")
-            now=$(date +%s)
-            if [ "$now" -lt "$ignore_until" ]; then
-                continue  # 窗口内，直接丢弃事件
-            fi
-            rm -f "$ignore_file"  # 窗口已过期，清理
-        fi
-
-        # 检查上次同步是否已完成
+        # 检查上次同步是否已完成（顺便 wait 收割僵尸进程）
         if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+            wait "$pid" 2>/dev/null
             pid=""
         fi
 
@@ -293,11 +371,18 @@ linux_watcher() {
             # 无进行中的同步 → 启动新的后台同步
             (
                 sync_linux_to_win "$proj" "$ldir" "$wdir"
-                # 检查管道，处理同步期间到达的新事件
-                while read -t0.001 -u3 2>/dev/null; do
+                # 聚合: drain 同步期间排队的全部 token, 只补跑一轮
+                # (父进程按 "ok" 节流, 补跑期间的新 token 由内层循环继续消化)
+                pending=false
+                while read -t0.001 -u3 2>/dev/null; do pending=true; done
+                if $pending; then
                     echo "ok" >&4
                     sync_linux_to_win "$proj" "$ldir" "$wdir"
-                done
+                    while read -t0.001 -u3 2>/dev/null; do
+                        echo "ok" >&4
+                        sync_linux_to_win "$proj" "$ldir" "$wdir"
+                    done
+                fi
                 # 写入完成时间戳，W→L 据此判断是否需要等待
                 date +%s > "$STATE_DIR/$proj/l2w_done"
             ) &
@@ -305,7 +390,7 @@ linux_watcher() {
             echo "$pid" > "$STATE_DIR/$proj/l2w_pid"
             waiting=0
         else
-            # 同步正在进行 → 通知后台进程"结束后再跑一次"
+            # 同步正在进行 → 通知后台进程"结束后再跑一轮"
             if [ $waiting -eq 1 ]; then
                 read -t0.001 -u4 2>/dev/null && waiting=0
             fi
@@ -333,29 +418,32 @@ windows_watcher() {
     while true; do
         sleep 5
 
-        # dry-run 检测变化
+        # dry-run 检测 Windows 侧变化 (带全局锁, 只统计 Windows 更新的文件)
         local changes
-        changes=$(rsync -rtin --no-owner --no-group --no-perms \
-            --modify-window=2 \
-            -e "ssh -p $SSH_PORT" --rsync-path="$WIN_RSYNC_PATH" \
-            "${RSYNC_EXCLUDES[@]}" \
-            "$(ssh_dest):$wdir/" "$ldir/" 2>/dev/null | grep -E '^[><cfhpguax*]' | wc -l)
+        changes=$(dryrun_w2l_changes "$proj" "$ldir" "$wdir")
 
-        [ "$changes" -eq 0 ] && continue
+        if [ "$changes" -eq 0 ]; then
+            # Windows 确认干净: 解除 --delete 保护锁 (也是失败/中断后的恢复路径)
+            rm -f "$STATE_DIR/$proj/windows_dirty"
+            continue
+        fi
 
-        log "$proj" "EVENT" "检测到 Windows 变化 ($changes 项)"
+        # 检测到 Windows 变化: 立即挂 dirty 保护锁 (期间 L→W 禁用 --delete),
+        # 尽早保护, 避免并发触发的 L→W 误删 Windows 新文件
+        : > "$STATE_DIR/$proj/windows_dirty"
+        log "$proj" "EVENT" "检测到 Windows 变化 ($changes 项), 锁定 windows_dirty (L→W --delete 暂时禁用)"
 
         # 等待 3 秒后重新确认，避免与 inotify 触发的 L→W 同步竞态
         # 场景：Linux 删除了文件，inotify 还没执行 L→W，但轮询先检测到了差异
         # 如果不等待，W→L 会把 Windows 上尚未被删除的文件复制回 Linux
         sleep 3
-        changes=$(rsync -rtin --no-owner --no-group --no-perms \
-            --modify-window=2 \
-            -e "ssh -p $SSH_PORT" --rsync-path="$WIN_RSYNC_PATH" \
-            "${RSYNC_EXCLUDES[@]}" \
-            "$(ssh_dest):$wdir/" "$ldir/" 2>/dev/null | grep -E '^[><cfhpguax*]' | wc -l)
+        changes=$(dryrun_w2l_changes "$proj" "$ldir" "$wdir")
 
-        [ "$changes" -eq 0 ] && { log "$proj" "OK" "变化已由 L→W 处理, 跳过 W→L"; continue; }
+        if [ "$changes" -eq 0 ]; then
+            rm -f "$STATE_DIR/$proj/windows_dirty"
+            log "$proj" "OK" "变化已由 L→W 处理, 跳过 W→L"
+            continue
+        fi
 
         # 检查 L→W 是否仍在运行（或刚完成，可能马上要跑下一轮）
         # 两种场景跳过 W→L：
@@ -381,20 +469,19 @@ windows_watcher() {
         fi
         $skip_w2l && continue
 
-        # 循环直到干净：处理同步期间的新变更
+        # dirty 锁已在检测到变化时挂上; 循环直到干净 (同步期间的新变更一并处理)
         local loop=0
         while true; do
             sync_win_to_linux "$proj" "$ldir" "$wdir" || break
 
-            changes=$(rsync -rtin --no-owner --no-group --no-perms \
-                --modify-window=2 \
-                -e "ssh -p $SSH_PORT" --rsync-path="$WIN_RSYNC_PATH" \
-                "${RSYNC_EXCLUDES[@]}" \
-                "$(ssh_dest):$wdir/" "$ldir/" 2>/dev/null | grep -E '^[><cfhpguax*]' | wc -l)
+            changes=$(dryrun_w2l_changes "$proj" "$ldir" "$wdir")
 
-            [ "$changes" -eq 0 ] && break
+            if [ "$changes" -eq 0 ]; then
+                rm -f "$STATE_DIR/$proj/windows_dirty"
+                break
+            fi
             ((loop++))
-            [ $loop -ge 10 ] && { log "$proj" "WARN" "W→L 循环达到上限,暂停"; break; }
+            [ $loop -ge 10 ] && { log "$proj" "WARN" "W→L 循环达到上限,暂停 (保留 dirty 锁)"; break; }
         done
     done
 }
@@ -435,7 +522,7 @@ if ! echo $$ > "$PID_FILE" 2>/dev/null; then
 fi
 
 ensure_state_dir
-rm -f "$GLOBAL_LOCK" /tmp/rsync_l2w_*.XXXXXX /tmp/rsync_w2l_*.XXXXXX
+rm -f "$GLOBAL_LOCK" /tmp/rsync_l2w_* /tmp/rsync_w2l_* /tmp/rsync_dry_*
 
 # 清理函数
 cleanup() {
@@ -445,13 +532,13 @@ cleanup() {
     sleep 1
     [ ${#ALL_PIDS[@]} -gt 0 ] && kill -9 "${ALL_PIDS[@]}" 2>/dev/null
     is_bidirectional && rm -rf "$STATE_DIR"
-    rm -f "$GLOBAL_LOCK" /tmp/rsync_l2w_*.XXXXXX /tmp/rsync_w2l_*.XXXXXX
+    rm -f "$GLOBAL_LOCK" /tmp/rsync_l2w_* /tmp/rsync_w2l_* /tmp/rsync_dry_*
     echo -e "\033[0;32m👋 已停止\033[0m"
     exit 0
 }
 trap cleanup SIGINT SIGTERM
 
-log "MAIN" "INIT" "========== v6.0 启动 (PID: $$) =========="
+log "MAIN" "INIT" "========== v6.1 启动 (PID: $$) =========="
 log "MAIN" "INIT" "模式: $(is_bidirectional && echo '双向 Linux ⇄ Windows' || echo '单向 Linux → Windows')"
 log "MAIN" "INIT" "项目数: ${#PROJECT_NAMES[@]}"
 
