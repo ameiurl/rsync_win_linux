@@ -1,7 +1,28 @@
 #!/bin/bash
 # 基于 syncd 架构的多项目双向实时同步脚本
 # 采用 FIFO 事件聚合模式，同步期间变更不丢失
-# 版本: 6.7
+# 版本: 6.9
+#
+# v6.9 变更:
+#   - 修复: v6.8 之后仍存在第三条复活路径 — 确认 L→W (v6.5 need_l2w_confirm
+#     机制) 复活 Windows 刚删除的 W2L 落地文件: 传播需凭证 (linux_known
+#     epoch ≤ last_l2w_ok) 才能删除, 而凭证要由确认 L→W 推进; 确认 L→W 会
+#     先把该文件复制回 Windows, 传播随后看到文件"还在"就永久跳过, 删除被
+#     撤销 (死循环)
+#   - 新增 W2L 落地台账 (w2l_landed): 记录"最近一次出现是 W2L 从 Windows
+#     同步过来"的路径 (Windows 来源), 由 sync_win_to_linux 解析 itemized
+#     输出 + watcher 按事件内核时间戳 (inotifywait %T, 不受管道处理延迟
+#     影响) 双重维护; 传播时 Windows 来源路径缺失即删除, 不再依赖凭证
+#   - 保护: Linux 侧真实创建 (W2L 窗口外) 会把路径从落地台账移除, 回退
+#     凭证规则, 避免误删 Linux 新建未同步文件
+#
+# v6.8 变更:
+#   - 修复: v6.7 的 W→L 回音抑制仍有残留盲区 — W→L 落地回音事件在
+#     inotifywait 管道里排队, 处理滞后于同步本身; sync_win_to_linux 先移除
+#     w2l_active 再记录 last_W2L, 排队事件恰好在 [移除, 记录] 窗口内被处理:
+#     w2l_active 已消失 (不拦截) 且 last_W2L 为旧值 (10s 抑制失效), 仍会启动
+#     L→W 把 Windows 刚删除的文件复制回去 (改为先记录 last_W2L 再移除
+#     w2l_active, 两个盲区窗口均关闭)
 #
 # v6.7 变更:
 #   - 修复: --exclude=~$* 因双引号被展开成命令行参数 (无参数时变成 --exclude=~,
@@ -417,12 +438,38 @@ propagate_win_deletions() {
     rc=$?
 
     if [ $rc -eq 0 ] || [ $rc -eq 24 ]; then
-        local deleted=0 skipped=0 rel ep
+        local deleted=0 skipped=0 rel ep w2l_ep
+        # W2L 落地台账修剪: 只保留最近 3000 条, 防无限增长
+        # (更早的 Windows 来源文件由 last_l2w_ok 凭证规则兜底)
+        if [ -f "$STATE_DIR/$proj/w2l_landed" ] && \
+           [ "$(wc -l < "$STATE_DIR/$proj/w2l_landed" 2>/dev/null || echo 0)" -gt 3000 ]; then
+            tail -n 2000 "$STATE_DIR/$proj/w2l_landed" \
+                > "$STATE_DIR/$proj/w2l_landed.tmp" 2>/dev/null && \
+                mv "$STATE_DIR/$proj/w2l_landed.tmp" "$STATE_DIR/$proj/w2l_landed" 2>/dev/null
+        fi
         while IFS= read -r l; do
             rel="${l#\*deleting}"
             rel="${rel#"${rel%%[! ]*}"}"
             [ -z "$rel" ] && continue
-            # 取该路径最近一次出现在 Linux 上的时间戳 (取最后一条匹配)
+            # v6.9: 先查 W2L 落地台账 — 该路径最近一次出现是 Windows 同步
+            # 过来的 (Windows 来源). Windows 侧缺失即删除, 不依赖凭证:
+            # 凭证机制存在死循环 (传播需确认 L→W 推进 last_l2w_ok, 而确认
+            # L→W 会先把文件复制回 Windows, 使删除被撤销)
+            w2l_ep=$(awk -F '\t' -v p="${rel%/}" \
+                '$2==p {e=$1} END {if (e!="") print e}' \
+                "$STATE_DIR/$proj/w2l_landed" 2>/dev/null)
+            if [ -n "$w2l_ep" ]; then
+                if [[ "$rel" == */ ]]; then
+                    rmdir "$ldir/$rel" 2>/dev/null && \
+                        { deleted=$((deleted+1)); log "$proj" "SYNC" "W→L 删除传播: $rel"; }
+                else
+                    rm -f "$ldir/$rel" && \
+                        { deleted=$((deleted+1)); log "$proj" "SYNC" "W→L 删除传播: $rel"; }
+                fi
+                continue
+            fi
+            # 无 Windows 来源凭证 → 回退 linux_known 凭证规则 (保守):
+            # 只删除能证明"在最近一次成功 L→W 之前就存在于 Linux"的路径
             ep=$(awk -F '\t' -v p="${rel%/}" \
                 '$2==p {e=$1} END {if (e!="") print e}' "$known_file" 2>/dev/null)
             if [ -n "$ep" ] && [ "$ep" -le "$last_ok" ]; then
@@ -540,6 +587,10 @@ sync_win_to_linux() {
     # 标记 w2l_active, linux_watcher 据此不把 rsync 替换文件的 DELETE 噪音
     # 写入删除台账
     : > "$STATE_DIR/$proj/w2l_active"
+    # W2L 落地窗口起点 (v6.9): watcher 按事件内核时间戳判定回音,
+    # 落在 [起点, 终点+2s] 内的 CREATE/MOVED_TO 记为 Windows 来源
+    wstart=$(date +%s)
+    echo "$wstart 0" > "$STATE_DIR/$proj/w2l_window"
     acquire_global_lock "$proj"
     # 删除台账: 排除 Linux 已删除的路径, 防止脏锁期间被 Windows 副本"复活".
     # 检查必须在锁内 (与 L→W 的锁内清空互斥), 否则文件可能在检查后被清空,
@@ -556,9 +607,20 @@ sync_win_to_linux() {
         "$(ssh_dest):$wdir/" "$ldir/"
     rc=$?
     release_global_lock
-    rm -f "$STATE_DIR/$proj/w2l_active"
+    # W2L 落地窗口终点 (+2s 宽限, 覆盖 rsync 落地事件的最后落点)
+    echo "$wstart $(( $(date +%s) + 2 ))" > "$STATE_DIR/$proj/w2l_window"
 
     if [ $rc -eq 0 ] || [ $rc -eq 24 ]; then
+        # W2L 落地台账 (v6.9): 解析 itemized 输出, 记录本次实际传输的路径
+        # (Windows 来源). 与 watcher 的回音记录互补: 即使回音事件处理延迟,
+        # 传播判定仍以本台账为准 (Windows 来源缺失即删除)
+        grep -E '^[><c]' "$tmp" 2>/dev/null | while IFS= read -r l; do
+            p2="${l:12}"
+            p2="${p2#"${p2%%[! ]*}"}"
+            [ -z "$p2" ] && continue
+            printf '%s\t%s\n' "$(date +%s)" "${p2%/}" \
+                >> "$STATE_DIR/$proj/w2l_landed"
+        done
         report_changes "$proj" "W→L" "$tmp"
         changes=$REPORT_CHANGES
         if [ "$changes" -gt 0 ]; then
@@ -573,6 +635,12 @@ sync_win_to_linux() {
     else
         log_rsync_failure "$proj" "W→L" "$rc" "$tmp"
     fi
+    # 必须先记录 last_W2L 再移除 w2l_active (v6.8): W→L 落地回音事件在
+    # inotifywait 管道里排队, 若先移除 w2l_active, 排队事件会在
+    # [移除, 记录] 窗口内被处理: 此时 w2l_active 已消失 (不拦截) 且
+    # last_W2L 还是旧值 (10s 抑制失效), 会启动 L→W 把 Windows 刚删除的
+    # 文件复制回去 (v6.7 修复的残留盲区)
+    rm -f "$STATE_DIR/$proj/w2l_active"
     rm -f "$tmp"
     return $rc
 }
@@ -595,11 +663,13 @@ linux_watcher() {
     trap "exec 3>&-; exec 4>&-; rm -f '$run_pipe' '$result_pipe'" EXIT
 
     # 注意: 管道右侧在子 shell 中运行, 不能用 local
+    # %T 为事件内核时间戳 (--timefmt '%s'), 用于区分 W2L 落地回音与真实创建:
+    # 回音事件可能因管道排队延迟处理, 按处理时刻判断会误分类 (v6.9)
     inotifywait -m -q -r \
         -e CREATE,CLOSE_WRITE,DELETE,MODIFY,MOVED_FROM,MOVED_TO \
         --excludei "$INOTIFY_EXCLUDE_PATTERN" \
-        --format '%e|%w%f' "$ldir" 2>/dev/null | \
-    while IFS='|' read -r events file; do
+        --timefmt '%s' --format '%T|%e|%w%f' "$ldir" 2>/dev/null | \
+    while IFS='|' read -r et events file; do
         # 过滤目录 MODIFY 事件（文件修改导致的目录 mtime 更新是噪音）
         # DELETE,ISDIR / CREATE,ISDIR / MOVE 事件必须保留，否则目录增删无法同步
         [[ "$events" =~ MODIFY ]] && [[ "$events" =~ ISDIR ]] && continue
@@ -628,6 +698,25 @@ linux_watcher() {
             rel2="${file#$ldir/}"
             if [ "$rel2" != "$file" ] && [ -n "$rel2" ]; then
                 record_linux_known "$proj" "$rel2"
+                # W2L 落地台账 (v6.9): 按事件内核时间戳判定回音 — 落在
+                # w2l_window 窗口内的 CREATE 是 rsync 落地 (Windows 来源),
+                # 记入台账; 窗口外的真实创建把该路径从台账移除 (Linux 来源
+                # 优先, 避免误删). 传播据此直接删除"Windows 来源且 Windows
+                # 已删"的路径, 不再依赖 last_l2w_ok 凭证 (凭证死循环见 v6.9
+                # 变更说明)
+                wstart=0; wend=0
+                [ -f "$STATE_DIR/$proj/w2l_window" ] && \
+                    read -r wstart wend < "$STATE_DIR/$proj/w2l_window" 2>/dev/null
+                if [ -n "$et" ] && [ "$wstart" -gt 0 ] && \
+                   [ "$et" -ge "$wstart" ] && [ "$et" -le "$wend" ]; then
+                    printf '%s\t%s\n' "$et" "$rel2" >> "$STATE_DIR/$proj/w2l_landed"
+                else
+                    awk -F '\t' -v p="$rel2" '$2!=p' \
+                        "$STATE_DIR/$proj/w2l_landed" \
+                        > "$STATE_DIR/$proj/w2l_landed.tmp" 2>/dev/null && \
+                        mv "$STATE_DIR/$proj/w2l_landed.tmp" \
+                           "$STATE_DIR/$proj/w2l_landed" 2>/dev/null
+                fi
             fi
         fi
 
@@ -869,7 +958,7 @@ cleanup() {
 }
 trap cleanup SIGINT SIGTERM
 
-log "MAIN" "INIT" "========== v6.7 启动 (PID: $$) =========="
+log "MAIN" "INIT" "========== v6.9 启动 (PID: $$) =========="
 log "MAIN" "INIT" "模式: $(is_bidirectional && echo '双向 Linux ⇄ Windows' || echo '单向 Linux → Windows')"
 log "MAIN" "INIT" "项目数: ${#PROJECT_NAMES[@]}"
 
