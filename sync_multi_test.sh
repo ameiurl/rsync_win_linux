@@ -103,16 +103,16 @@ SSH_OPTS="-o ConnectTimeout=5 -o BatchMode=yes -o ServerAliveInterval=15"
 WIN_RSYNC_PATH="\"D:/Program Files (x86)/cwRsync/bin/rsync.exe\""
 
 RETRY_MAX=10
-LOG_FILE="/home/amei/multi_sync.log"
+LOG_FILE="/tmp/sync_test.log"
 LOG_MAX_SIZE=10485760        # 10MB, 超出后轮转为 .1
-PID_FILE="/tmp/multi_sync.pid"
-STATE_DIR="/tmp/sync_state"
+PID_FILE="/tmp/multi_sync_test.pid"
+STATE_DIR="/tmp/sync_state_test"
 
 PROJECT_BASE_NAMES=(
-    "mallphp"
-    "admin_frontend"
-    "store_uniapp"
-    "admin_diy_frontend"
+    "__synctest"
+
+
+
 )
 
 RSYNC_EXCLUDES=(
@@ -195,7 +195,7 @@ ssh_dest() { echo "${SSH_USER}@${SSH_HOST}"; }
 # ============================================================================
 # 全局 rsync 互斥锁（避免多个 rsync 同时连接 cwRsync 导致 error 12）
 # ============================================================================
-GLOBAL_LOCK="/tmp/rsync_global.lock"
+GLOBAL_LOCK="/tmp/rsync_global_test.lock"
 
 acquire_global_lock() {
     local holder
@@ -836,7 +836,7 @@ if ! echo $$ > "$PID_FILE" 2>/dev/null; then
 fi
 
 ensure_state_dir
-rm -f "$GLOBAL_LOCK" /tmp/rsync_l2w_* /tmp/rsync_w2l_* /tmp/rsync_dry_*
+rm -f "$GLOBAL_LOCK" /tmp/rsync_l2w___synctest_* /tmp/rsync_w2l___synctest_* /tmp/rsync_dry___synctest_* /tmp/rsync_wdel___synctest_*
 
 # 清理函数
 # 收割 watcher 进程树: inotifywait 与管道右侧子 shell 是 watcher 的子进程,
@@ -863,7 +863,7 @@ cleanup() {
     sleep 1
     [ ${#ALL_PIDS[@]} -gt 0 ] && kill_watcher_tree -9
     is_bidirectional && rm -rf "$STATE_DIR"
-    rm -f "$GLOBAL_LOCK" /tmp/rsync_l2w_* /tmp/rsync_w2l_* /tmp/rsync_dry_*
+    rm -f "$GLOBAL_LOCK" /tmp/rsync_l2w___synctest_* /tmp/rsync_w2l___synctest_* /tmp/rsync_dry___synctest_* /tmp/rsync_wdel___synctest_*
     echo -e "\033[0;32m👋 已停止\033[0m"
     exit 0
 }
