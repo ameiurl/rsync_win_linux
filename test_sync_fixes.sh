@@ -7,8 +7,10 @@ trap 'rm -rf "$T"' EXIT
 mkdir -p "$T/bin" "$T/state"
 
 # 截取到 "# 入口" 之前: 只含配置 + 函数定义
-# 顺带替换 LOG_FILE, 避免测试日志写入正式日志 (v6.7)
-sed '/^# 入口$/,$d; s|LOG_FILE="/home/amei/multi_sync.log"|LOG_FILE="'"$T"'/app.log"|' sync_multi.sh > "$T/funcs.sh"
+# 同时替换 LOG_FILE/STATE_DIR/GLOBAL_LOCK: funcs.sh 内的硬编码赋值会覆盖
+# 下方 export, 不替换则测试会污染生产状态目录 /tmp/sync_state 并争抢
+# 生产全局锁 /tmp/rsync_global.lock (v6.10 修复)
+sed '/^# 入口$/,$d; s|LOG_FILE="/home/amei/multi_sync.log"|LOG_FILE="'"$T"'/app.log"|; s|^STATE_DIR="/tmp/sync_state"|STATE_DIR="'"$T"'/state"|; s|^GLOBAL_LOCK="/tmp/rsync_global.lock"|GLOBAL_LOCK="'"$T"'/global.lock"|' sync_multi.sh > "$T/funcs.sh"
 
 # 假 rsync: 记录参数, 输出 itemized 变更, 按 FAKE_RSYNC_RC 退出
 cat > "$T/bin/rsync" <<'EOF'

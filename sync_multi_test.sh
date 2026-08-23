@@ -1,7 +1,20 @@
 #!/bin/bash
 # 基于 syncd 架构的多项目双向实时同步脚本
 # 采用 FIFO 事件聚合模式，同步期间变更不丢失
-# 版本: 6.9
+# 版本: 6.10
+#
+# v6.10 变更:
+#   - 修复: 启动初始 L→W 带 --delete, 停机期间 Windows 新建的文件会在重启
+#     瞬间被误删 (干净停机清空 STATE_DIR 后 windows_dirty 必然不存在);
+#     初始 L→W 之前挂上 windows_dirty, 由轮询首次确认干净后自动解除
+#   - 修复: W2L 落地窗口起点在拿锁之前设置、终点带 +2s 宽限 — 窗口尾巴会把
+#     W→L 完成后 2s 内 Linux 真实新建的文件误判为回音写入 w2l_landed,
+#     叠加 10s 回音抑制压制补救 L→W, 文件随后被删除传播误删
+#     (起点移入锁内, 终点改为锁内收窗且不加宽限: 回音事件带内核时间戳,
+#     必然落在 [起点, 传输结束] 内, 宽限纯属有害)
+#   - 修复: w2l_active 在拿全局锁之前就标记, 排队等锁期间 Linux 真实删除
+#     漏记 pending_deletes, 复活窗口被放大到持锁时长 (大批量同步时可达分钟级);
+#     标记移入锁内 — 等锁期间 W→L 尚未开始, 不存在回音, 删除应正常记账
 #
 # v6.9 变更:
 #   - 修复: v6.8 之后仍存在第三条复活路径 — 确认 L→W (v6.5 need_l2w_confirm
@@ -584,14 +597,20 @@ sync_win_to_linux() {
 
     # W→L: 只新增和更新，不删除（避免竞态删除 Linux 新创建的文件/目录）
     # 删除统一由 L→W 方向的 --delete 控制（Linux 为权威端）
-    # 标记 w2l_active, linux_watcher 据此不把 rsync 替换文件的 DELETE 噪音
-    # 写入删除台账
+    # 落地窗口哨兵: 拿锁前窗口关闭 (起点=0), 排队等锁期间的真实事件
+    # 不会被归入回音窗口 (v6.10)
+    echo "0 0" > "$STATE_DIR/$proj/w2l_window"
+    acquire_global_lock "$proj"
+    # v6.10: w2l_active 标记移入锁内 — 排队等锁期间 W→L 尚未开始, 不存在
+    # 回音; 此前标记在锁外, 等锁期间 Linux 真实删除被静默丢弃 (漏记
+    # pending_deletes), 随后的 W→L 会把已删文件从 Windows 复活, 复活窗口
+    # 等于持锁时长 (大批量同步时可达分钟级). 标记只覆盖真实传输时段
     : > "$STATE_DIR/$proj/w2l_active"
-    # W2L 落地窗口起点 (v6.9): watcher 按事件内核时间戳判定回音,
-    # 落在 [起点, 终点+2s] 内的 CREATE/MOVED_TO 记为 Windows 来源
+    # W2L 落地窗口起点 (v6.9): 在锁内开窗, 起点 = 传输真正开始.
+    # watcher 按事件内核时间戳判定回音, 落在 [起点, 终点] 内的
+    # CREATE/MOVED_TO 记为 Windows 来源
     wstart=$(date +%s)
     echo "$wstart 0" > "$STATE_DIR/$proj/w2l_window"
-    acquire_global_lock "$proj"
     # 删除台账: 排除 Linux 已删除的路径, 防止脏锁期间被 Windows 副本"复活".
     # 检查必须在锁内 (与 L→W 的锁内清空互斥), 否则文件可能在检查后被清空,
     # rsync 打开 --exclude-from 时报 exit 11
@@ -606,9 +625,12 @@ sync_win_to_linux() {
         "${RSYNC_EXCLUDES[@]}" \
         "$(ssh_dest):$wdir/" "$ldir/"
     rc=$?
+    # v6.10: 锁内收窗, 终点 = 传输结束, 去掉 +2s 宽限 — 回音事件带内核
+    # 时间戳 (%T), 必然 ≤ 传输结束时刻; +2s 尾巴只会把完成后 2s 内 Linux
+    # 真实新建的文件误判为回音写入 w2l_landed, 叠加 10s 回音抑制压制补救
+    # L→W, 文件随后被删除传播误删 (见 v6.10 变更说明)
+    echo "$wstart $(date +%s)" > "$STATE_DIR/$proj/w2l_window"
     release_global_lock
-    # W2L 落地窗口终点 (+2s 宽限, 覆盖 rsync 落地事件的最后落点)
-    echo "$wstart $(( $(date +%s) + 2 ))" > "$STATE_DIR/$proj/w2l_window"
 
     if [ $rc -eq 0 ] || [ $rc -eq 24 ]; then
         # W2L 落地台账 (v6.9): 解析 itemized 输出, 记录本次实际传输的路径
@@ -958,7 +980,7 @@ cleanup() {
 }
 trap cleanup SIGINT SIGTERM
 
-log "MAIN" "INIT" "========== v6.9 启动 (PID: $$) =========="
+log "MAIN" "INIT" "========== v6.10 启动 (PID: $$) =========="
 log "MAIN" "INIT" "模式: $(is_bidirectional && echo '双向 Linux ⇄ Windows' || echo '单向 Linux → Windows')"
 log "MAIN" "INIT" "项目数: ${#PROJECT_NAMES[@]}"
 
@@ -975,6 +997,12 @@ for i in "${!PROJECT_NAMES[@]}"; do
 
     # 快照 Linux 现有文件台账 (W→L 删除传播的凭证基础, 见 propagate_win_deletions)
     seed_linux_known "$p" "$ld"
+
+    # v6.10 启动保护: 初始 L→W 之前挂上 windows_dirty, 使其不带 --delete —
+    # 否则停机期间 Windows 上新建的文件会在重启瞬间被误删 (干净停机时
+    # STATE_DIR 被清空, windows_dirty 必然不存在). 该锁由 windows_watcher
+    # 首次 dry-run 确认干净后自动解除, 之后 L→W 恢复 --delete
+    is_bidirectional && : > "$STATE_DIR/$p/windows_dirty"
 
     # 初始同步（不检查防回环）
     log "$p" "INIT" "初始同步 L→W..."
