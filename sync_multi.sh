@@ -178,7 +178,7 @@ done
 # ============================================================================
 log() {
     local proj="$1" level="$2" msg="$3"
-    local ts=$(date '+%Y-%m-%d %H:%M:%S')
+    local ts=$(date '+%H:%M:%S')
     local color="" sym=""
     case "$level" in
         SYNC)   color='\033[0;36m'; sym="🔄" ;;
@@ -196,12 +196,12 @@ log() {
         if [ "${sz:-0}" -gt "$LOG_MAX_SIZE" ]; then
             mv -f "$LOG_FILE" "$LOG_FILE.1" 2>/dev/null || true
             : > "$LOG_FILE"
-            echo "[$ts] ℹ️ [MAIN] 日志已轮转 (>${LOG_MAX_SIZE}B)" >> "$LOG_FILE"
+            printf "%s %s %s %s\n" "$ts" "ℹ️" "MAIN" "日志已轮转 (>${LOG_MAX_SIZE}B)" >> "$LOG_FILE"
         fi
     fi
-    # 终端带颜色, 文件只写纯文本
-    printf "[%s] ${color}%s [%s]${color} %s\033[0m\n" "$ts" "$sym" "$proj" "$msg"
-    printf "[%s] %s [%s] %s\n" "$ts" "$sym" "$proj" "$msg" >> "$LOG_FILE"
+    # 终端带颜色, 文件只写纯文本 (紧凑格式: 无括号)
+    printf "%s ${color}%s %s${color} %s\033[0m\n" "$ts" "$sym" "$proj" "$msg"
+    printf "%s %s %s %s\n" "$ts" "$sym" "$proj" "$msg" >> "$LOG_FILE"
 }
 
 is_bidirectional() { [[ "$SYNC_MODE" == "bidirectional" ]]; }
@@ -284,6 +284,31 @@ run_rsync_locked() {
     return $exit_code
 }
 
+# rsync itemize 明细行 → "A/M/D + 路径", 行短且信息完整 (git 风格):
+#   A: 全部属性列为 '+' → 接收端原本没有, 属新建 (含新建目录 cd+++++++++)
+#   D: *deleting 消息行
+#   M: 其余 itemize 行 (内容/时间/权限等属性变化, 含目录 mtime 更新)
+# 非明细行原样返回 (rsync 错误信息等)
+compact_item() {
+    local l="$1" p
+    p='^\*deleting[[:space:]]+(.*)$'
+    if [[ "$l" =~ $p ]]; then
+        echo "D ${BASH_REMATCH[1]}"
+        return
+    fi
+    p='^[<>.ch][fdLDS]\+{9}[[:space:]](.*)$'
+    if [[ "$l" =~ $p ]]; then
+        echo "A ${BASH_REMATCH[1]}"
+        return
+    fi
+    p='^[<>.ch][fdLDS][a-zA-Z0-9.+=_-]{9}[[:space:]](.*)$'
+    if [[ "$l" =~ $p ]]; then
+        echo "M ${BASH_REMATCH[1]}"
+        return
+    fi
+    echo "$l"
+}
+
 # 统计并记录 itemized 变更; 变更数通过全局变量 REPORT_CHANGES 返回
 # (不能通过 echo 返回: log 会写 stdout, 被 $(...) 捕获后破坏数字判断)
 report_changes() {
@@ -296,9 +321,9 @@ report_changes() {
     show=20
     [ "$changes" -gt 20 ] && show=5
     grep -E '^[><cfhpguax*]' "$tmp" 2>/dev/null | head -n "$show" | while IFS= read -r l; do
-        log "$proj" "SYNC" "  $l"
+        log "$proj" "SYNC" "$(compact_item "$l")"
     done
-    [ "$changes" -gt 20 ] && log "$proj" "SYNC" "  (仅显示前5条, 共${changes}条)"
+    [ "$changes" -gt 20 ] && log "$proj" "SYNC" "(仅显示前5条, 共${changes}条)"
     REPORT_CHANGES=$changes
 }
 
@@ -306,7 +331,7 @@ log_rsync_failure() {
     local proj="$1" direction="$2" rc="$3" tmp="$4"
     log "$proj" "ERROR" "$direction 失败 (exit=$rc)"
     tail -n 3 "$tmp" 2>/dev/null | while IFS= read -r l; do
-        [ -n "$l" ] && log "$proj" "ERROR" "  $l"
+        [ -n "$l" ] && log "$proj" "ERROR" "$l"
     done
 }
 
@@ -404,7 +429,7 @@ dryrun_w2l_changes() {
         if [ $((now - last_fail)) -gt 60 ]; then
             log "$proj" "ERROR" "W→L dry-run 失败 (exit=$rc)"
             tail -n 2 "$tmp" 2>/dev/null | while IFS= read -r l; do
-                [ -n "$l" ] && log "$proj" "ERROR" "  $l"
+                [ -n "$l" ] && log "$proj" "ERROR" "$l"
             done
             date +%s > "$fail_ts_file"
         fi
