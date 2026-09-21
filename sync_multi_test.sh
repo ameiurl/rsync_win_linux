@@ -1,7 +1,40 @@
 #!/bin/bash
 # 基于 syncd 架构的多项目双向实时同步脚本
 # 采用 FIFO 事件聚合模式，同步期间变更不丢失
-# 版本: 6.10
+# 版本: 6.12
+#
+# v6.12 变更:
+#   - 优化 (P1): 轮询给事件同步让路 — L→W 正在运行或刚完成 3s 内时, 该项目的
+#     轮询跳过本轮扫描 (POLL_YIELD_TO_L2W, 连续让路上限 POLL_YIELD_MAX=3 轮,
+#     之后必扫一次, 保证 W→L 不被饿死). 实测空闲时轮询扫描占满 rsync 活动与
+#     全局锁 (90s/32 次扫描、锁 86~95%、L→W 抢锁等待中位 3.3s), 编辑期间让路
+#     可直接缩短"保存 → 同步"的等待; 代价是编辑期间 W→L 检测最多暂停 3 个周期
+#   - 配套: L→W 子 shell 正常结束时清掉 l2w_pid 台账, 使"在跑"判断只覆盖真实
+#     运行时段 (kill -0 存活判断仍兜底异常退出)
+#
+# v6.11 变更:
+#   - 修复: W→L dry-run 失败被当成"Windows 干净" — dryrun 失败时 changes=0,
+#     轮询器据此解除 windows_dirty 保护锁, 随后的 L→W 会带 --delete 删掉
+#     Windows 上尚未回传的新文件 (v6.1 那类误删). 现在只有 dry-run 成功
+#     (rc=0/24) 且 0 变更才解除保护锁, 失败一律保留 (保守降级)
+#   - 优化: 合并每周期两次全树 W→L dry-run (变更检测 + 删除检测) 为一次
+#     --delete 扫描 (w2l_scan): 每项目每周期 ssh rsync 次数减半, 全局锁
+#     占用与连接数同步下降. 变更计数排除 *deleting 行 (仅 Linux 单边存在
+#     ≠ Windows 变更, 计入会触发徒劳的 W→L 循环); 删除传播仍在同一把锁内
+#     完成, 凭证规则 (w2l_landed / linux_known + last_l2w_ok) 不变
+#   - 优化: windows_dirty 改在锁内、早于删除传播挂上 (原先在第二次扫描前
+#     才挂), 关闭两轮之间的竞态窗口
+#   - 修复 (回归测试中复现): L→W 带 --delete 时, 排队等锁期间 Windows 新建的
+#     文件还没被轮询发现, windows_dirty 尚未挂上, 等这次 L→W 拿到锁就把该文件
+#     删掉了 (头部已知约束里那条 ≤1 轮询周期窗口, 实测可复现).
+#     新增 L→W 安全预检 (L2W_DELETE_PRECHECK, 默认开启): 带 --delete 前先做一次
+#     W→L dry-run, 发现 Windows 有未回传变更/扫描失败即放弃本次 --delete 并挂
+#     windows_dirty, 由轮询 W→L 收走变更 (保守降级, 变更不丢)
+#   - 修复: 上一条的预检只覆盖首次尝试, 首次 error 12 失败后持锁退避 1~4s 再
+#     重试时, 删除许可已过期 (退避期间 Windows 新建的文件从未被检查), 重试仍
+#     带 --delete 会误删 (回归测试实测复现). 现在重试一律降级去掉 --delete,
+#     并把 pending_deletes 台账留到下次真正执行删除的 L→W 再清空
+#     (否则可能被 W→L 复活已删文件)
 #
 # v6.10 变更:
 #   - 修复: 启动初始 L→W 带 --delete, 停机期间 Windows 新建的文件会在重启
@@ -118,9 +151,10 @@
 #     该次删除仍存在被复活的窄窗口.
 #   - Windows 删除传播到 Linux (v6.4) 依赖 linux_known/last_l2w_ok 凭证;
 #     无凭证的候选路径一律不删, inotify 丢事件时该特性自动降级为不删.
-#   - L→W 的 --delete 仍存在 ≤1 个轮询周期(5s)的误删窗口: Windows 新建文件后、
-#     轮询尚未检测到之前, 若恰好发生 Linux 事件触发 L→W, 该文件可能被删.
-#     如需彻底消除, 可把轮询间隔调小, 或 L→W 前先做一次 W→L dry-run 确认干净.
+#   - L→W 的 --delete 在 L2W_DELETE_PRECHECK=false 时仍存在 ≤1 个轮询周期(5s)
+#     的误删窗口: Windows 新建文件后、轮询尚未检测到之前, 若恰好发生 Linux 事件
+#     触发 L→W, 该文件可能被删. 默认 true 时由 L→W 前的 W→L dry-run 确认消除
+#     (代价: 每次带 --delete 的 L→W 多一次扫描, 约 +2~3s)
 
 # ============================================================================
 # 配置
@@ -128,6 +162,19 @@
 SYNC_MODE="bidirectional"   # bidirectional | unidirectional
 # 是否把 Windows 上的删除同步到 Linux (仅双向模式, 见 v6.4 变更)
 PROPAGATE_WIN_DELETE="true"
+# L→W 带 --delete 之前, 先做一次 W→L dry-run 确认 Windows 没有未回传变更
+# true  = 稳定优先: 每次带 --delete 的 L→W 多一次扫描 (约 +2~3s/次),
+#         消除 "Windows 新建/修改的文件在轮询挂上 dirty 之前被 L→W --delete
+#         删掉" 的竞态 (v6.10 及以前存在, 实测可复现, 见 w2l_clean_check)
+# false = 延迟优先: 回到旧行为, 保留该误删窗口
+L2W_DELETE_PRECHECK="true"
+# P1 (v6.12): L→W 正在运行 (或刚完成 POLL_YIELD_GRACE 秒) 时, 轮询跳过本轮扫描,
+# 把全局锁让给事件触发的 L→W. 空闲时轮询扫描几乎占满 rsync 活动与全局锁
+# (实测 90s 内 32 次扫描、锁占用 86~95%), 编辑期间让路可直接降低 L→W 等待.
+# 连续让路最多 POLL_YIELD_MAX 轮, 之后无论如何扫一次, 保证 W→L 不被饿死
+POLL_YIELD_TO_L2W="true"
+POLL_YIELD_MAX=3
+POLL_YIELD_GRACE=3
 
 SSH_USER="amei"
 SSH_HOST="192.168.1.10"
@@ -254,13 +301,35 @@ sync_precheck_dirty() {
     [ ! -f "$STATE_DIR/$1/windows_dirty" ]
 }
 
-# 可选: 每次 rsync 尝试前执行的检查函数名 (见 run_rsync_locked)
+# L→W 是否正在运行 / 刚刚完成 (v6.12, 轮询让路判断用):
+#   l2w_pid 里的进程仍存活, 或 l2w_done 距今 < $2 秒 (默认 3)
+# l2w_pid 由 linux_watcher 启动同步子 shell 时写入、子 shell 结束前删除,
+# 因此"文件存在且进程存活"即代表 L→W 真正在跑
+l2w_active_recent() {
+    local proj="$1" grace="${2:-3}"
+    local pf="$STATE_DIR/$proj/l2w_pid" df="$STATE_DIR/$proj/l2w_done" p d now
+    if [ -f "$pf" ]; then
+        p=$(cat "$pf" 2>/dev/null)
+        [ -n "$p" ] && kill -0 "$p" 2>/dev/null && return 0
+    fi
+    if [ -f "$df" ]; then
+        d=$(cat "$df" 2>/dev/null); now=$(date +%s)
+        [ -n "$d" ] && [ $((now - d)) -lt "$grace" ] && return 0
+    fi
+    return 1
+}
+
+# 可选: 每次 rsync 尝试前执行的检查函数名 (见 run_rsync_locked)、
+# 重试时是否去掉 --delete (v6.11)、本次是否已因降级跳过删除
 RSYNC_PRECHECK_FN=""
+RSYNC_RETRY_DROP_DELETE=""
+RSYNC_DELETE_SKIPPED=0
 
 # 前提: 调用方已持有全局锁; 带重试执行 rsync
 run_rsync_locked() {
     local label="$1" output_file="$2"; shift 2
-    local attempt=1 delay exit_code
+    local attempt=1 delay exit_code a keep=()
+    local args=("$@")
 
     while [ $attempt -le $RETRY_MAX ]; do
         # 每次尝试前重新预检: 重试期间状态可能变化 (如 windows_dirty 被挂锁),
@@ -269,12 +338,26 @@ run_rsync_locked() {
             log "$label" "WARN" "预检中止: 执行期间 windows_dirty 已挂锁, 放弃 --delete"
             return 10
         fi
-        rsync "$@" > "$output_file" 2>&1
+        rsync "${args[@]}" > "$output_file" 2>&1
         exit_code=$?
 
         if { [ $exit_code -eq 12 ] || [ $exit_code -eq 23 ] || [ $exit_code -eq 11 ]; } && [ $attempt -lt $RETRY_MAX ]; then
             delay=$((1 + RANDOM % 4))
             log "$label" "WARN" "错误 [${exit_code}], 重试 ${attempt}/${RETRY_MAX} (${delay}s)..."
+            # v6.11 安全降级: 重试一律去掉 --delete. 删除许可来自"预检那一刻"的
+            # Windows 快照, 退避期间 (1~4s, 甚至更久) Windows 新建的文件从未被
+            # 检查过, 继续带 --delete 重试会把它删掉 (实测: 首次 error 12 →
+            # 退避 3s 期间 Windows 建文件 → 重试把该文件删了). 删除留到下次
+            # 不带降级标志的 L→W 补做, 不丢数据
+            if [ "$RSYNC_RETRY_DROP_DELETE" = "true" ]; then
+                keep=()
+                for a in "${args[@]}"; do [ "$a" = "--delete" ] || keep+=("$a"); done
+                if [ ${#keep[@]} -ne ${#args[@]} ]; then
+                    args=("${keep[@]}")
+                    RSYNC_DELETE_SKIPPED=1
+                fi
+                RSYNC_RETRY_DROP_DELETE=""
+            fi
             sleep "$delay"
             ((attempt++))
             continue
@@ -392,11 +475,18 @@ record_linux_known() {
 }
 
 # ============================================================================
-# 带全局锁的 W→L dry-run: 只统计 Windows 侧更新的变更
+# W→L 单次持锁扫描 (v6.11): 一次 --delete dry-run 同时得到
+#   - Windows 侧变更计数 DRYRUN_CHANGES (不含 *deleting 行: "Linux 有、Windows 无"
+#     不是 Windows 变更, 计入会让轮询误判脏并触发徒劳的 W→L 循环)
+#   - 删除传播候选 (*deleting 行), 在同一把锁内完成凭证校验与删除
+# 原先每周期每项目要跑 2 次全树 ssh rsync (变更检测 + 删除检测), 合并后减半,
+# 锁占用与连接数同步下降 (error 12 与排队延迟随之降低); 变更与删除仍共用
+# 同一把全局锁, 删除语义/凭证规则完全不变.
 # (--update 过滤掉"Linux 比 Windows 新"的文件, 那些由 inotify 触发的 L→W 负责,
 #  避免方向混淆: 否则 Linux 侧变更会触发徒劳的 W→L 循环)
+# 输出: DRYRUN_CHANGES(仅 Windows 变更), DRYRUN_RC
 # ============================================================================
-dryrun_w2l_changes() {
+w2l_scan() {
     local proj="$1" ldir="$2" wdir="$3"
     local tmp rc changes del_excl=()
     DRYRUN_CHANGES=0
@@ -410,63 +500,6 @@ dryrun_w2l_changes() {
     [ -s "$STATE_DIR/$proj/pending_deletes" ] && \
         del_excl=(--exclude-from="$STATE_DIR/$proj/pending_deletes")
 
-    rsync -rtin --update --no-owner --no-group --no-perms \
-        --modify-window=2 --timeout=30 \
-        -e "ssh $SSH_OPTS -p $SSH_PORT" --rsync-path="$WIN_RSYNC_PATH" \
-        "${del_excl[@]}" \
-        "${RSYNC_EXCLUDES[@]}" \
-        "$(ssh_dest):$wdir/" "$ldir/" > "$tmp" 2>&1
-    rc=$?
-    release_global_lock
-
-    changes=$(grep -E '^[><cfhpguax*]' "$tmp" 2>/dev/null | wc -l)
-    if [ $rc -ne 0 ] && [ $rc -ne 24 ]; then
-        # 失败时每 60s 只记一次, 避免 Windows 离线期间刷屏
-        local fail_ts_file="$STATE_DIR/$proj/dry_fail_ts"
-        local now=$(date +%s)
-        local last_fail=0
-        [ -f "$fail_ts_file" ] && last_fail=$(cat "$fail_ts_file" 2>/dev/null || echo 0)
-        if [ $((now - last_fail)) -gt 60 ]; then
-            log "$proj" "ERROR" "W→L dry-run 失败 (exit=$rc)"
-            tail -n 2 "$tmp" 2>/dev/null | while IFS= read -r l; do
-                [ -n "$l" ] && log "$proj" "ERROR" "$l"
-            done
-            date +%s > "$fail_ts_file"
-        fi
-        changes=0
-    fi
-    rm -f "$tmp"
-    # 通过全局变量返回 (log 会写 stdout, 不能再用 echo 交给 $(...) 捕获)
-    DRYRUN_CHANGES=$changes
-    DRYRUN_RC=$rc
-}
-
-# ============================================================================
-# Windows 删除 → Linux 传播 (可选, 见 PROPAGATE_WIN_DELETE)
-# 安全机制: "Linux 有、Windows 无" 可能是 Windows 删除, 也可能是 Linux 新建
-# 尚未同步; 只删除能证明"在最近一次成功 L→W 之前就已存在于 Linux"的路径:
-#   - linux_known: 启动时全量快照 + inotify CREATE/MOVED_TO 增量 (epoch\tpath)
-#   - last_l2w_ok: 最近一次 rc=0 的 L→W 完成时间
-# 无凭证路径一律跳过 (保守), 检测/校验/删除全程持全局锁避免与 L→W 交错
-# ============================================================================
-propagate_win_deletions() {
-    is_bidirectional || return 0
-    [ "$PROPAGATE_WIN_DELETE" = "true" ] || return 0
-    local proj="$1" ldir="$2" wdir="$3"
-    local tmp rc del_excl=()
-    local known_file="$STATE_DIR/$proj/linux_known"
-    [ -s "$known_file" ] || return 0
-    tmp=$(mktemp "/tmp/rsync_wdel_${proj}.XXXXXX")
-
-    acquire_global_lock
-    local last_ok=0
-    [ -f "$STATE_DIR/$proj/last_l2w_ok" ] && \
-        last_ok=$(cat "$STATE_DIR/$proj/last_l2w_ok" 2>/dev/null || echo 0)
-
-    [ -s "$STATE_DIR/$proj/pending_deletes" ] && \
-        del_excl=(--exclude-from="$STATE_DIR/$proj/pending_deletes")
-
-    # W→L 方向 dry-run --delete: 只列出"Linux 有、Windows 无"的候选删除项
     rsync -rtin --delete --update --no-owner --no-group --no-perms \
         --modify-window=2 --timeout=30 \
         -e "ssh $SSH_OPTS -p $SSH_PORT" --rsync-path="$WIN_RSYNC_PATH" \
@@ -476,6 +509,94 @@ propagate_win_deletions() {
     rc=$?
 
     if [ $rc -eq 0 ] || [ $rc -eq 24 ]; then
+        # 变更计数: 排除 *deleting (仅 Linux 单边存在 ≠ Windows 有变更)
+        changes=$(grep -v '^\*deleting' "$tmp" 2>/dev/null | grep -cE '^[><cfhpguax*]')
+        # Windows 有变更 → 锁内立即挂 dirty 保护锁 (早于删除传播, 关闭竞态窗口)
+        [ "$changes" -gt 0 ] && : > "$STATE_DIR/$proj/windows_dirty"
+        # 删除传播与本次扫描共用同一把锁: 检测/校验/删除不与 L→W 交错
+        propagate_win_deletions "$proj" "$ldir" "$tmp"
+    else
+        # 失败时每 60s 只记一次, 避免 Windows 离线期间刷屏.
+        # 失败一律 changes=0, 且由调用方保留 windows_dirty — 无凭证时宁可
+        # 不删、不放开 --delete (见 windows_watcher 里的 DRYRUN_RC 判断)
+        local fail_ts_file="$STATE_DIR/$proj/dry_fail_ts"
+        local now=$(date +%s)
+        local last_fail=0
+        [ -f "$fail_ts_file" ] && last_fail=$(cat "$fail_ts_file" 2>/dev/null || echo 0)
+        if [ $((now - last_fail)) -gt 60 ]; then
+            log "$proj" "ERROR" "W→L dry-run 失败 (exit=$rc): 变更检测与删除传播均跳过"
+            tail -n 2 "$tmp" 2>/dev/null | while IFS= read -r l; do
+                [ -n "$l" ] && log "$proj" "ERROR" "$l"
+            done
+            date +%s > "$fail_ts_file"
+        fi
+        changes=0
+    fi
+    release_global_lock
+
+    rm -f "$tmp"
+    # 通过全局变量返回 (log 会写 stdout, 不能再用 echo 交给 $(...) 捕获)
+    DRYRUN_CHANGES=$changes
+    DRYRUN_RC=$rc
+}
+
+# ============================================================================
+# L→W --delete 前的 W→L 干净确认 (v6.11 安全预检)
+# 前提: 调用方已持全局锁 (不可在此再 acquire, 否则自锁死)
+# 返回 0 = Windows 无未回传变更 (允许 --delete)
+#      1 = 检测到 Windows 变更 (调用方放弃 --delete 并挂 windows_dirty)
+#      2 = 扫描失败 (保守: 同样放弃 --delete)
+# 消除已知约束里那条 "≤1 个轮询周期" 的误删窗口: Windows 新建文件后、轮询
+# 尚未挂 dirty 之前, 排队中的 L→W 拿到锁仍会带 --delete 把它删掉 (实测可复现)
+# ============================================================================
+w2l_clean_check() {
+    local proj="$1" ldir="$2" wdir="$3"
+    local tmp rc changes del_excl=()
+    tmp=$(mktemp "/tmp/rsync_dry_${proj}.XXXXXX")
+    [ -s "$STATE_DIR/$proj/pending_deletes" ] && \
+        del_excl=(--exclude-from="$STATE_DIR/$proj/pending_deletes")
+
+    rsync -rtin --update --no-owner --no-group --no-perms \
+        --modify-window=2 --timeout=30 \
+        -e "ssh $SSH_OPTS -p $SSH_PORT" --rsync-path="$WIN_RSYNC_PATH" \
+        "${del_excl[@]}" \
+        "${RSYNC_EXCLUDES[@]}" \
+        "$(ssh_dest):$wdir/" "$ldir/" > "$tmp" 2>&1
+    rc=$?
+    changes=$(grep -v '^\*deleting' "$tmp" 2>/dev/null | grep -cE '^[><cfhpguax*]')
+    rm -f "$tmp"
+
+    if [ $rc -ne 0 ] && [ $rc -ne 24 ]; then
+        W2L_CHECK_RC=$rc
+        return 2
+    fi
+    [ "$changes" -gt 0 ] && return 1
+    return 0
+}
+
+# ============================================================================
+# Windows 删除 → Linux 传播 (可选, 见 PROPAGATE_WIN_DELETE)
+# 前提: 调用方持有全局锁, $3 为 w2l_scan 的 --delete dry-run 输出文件
+# (v6.11 起不再自己跑 rsync: 与变更检测共用同一次扫描)
+# 安全机制: "Linux 有、Windows 无" 可能是 Windows 删除, 也可能是 Linux 新建
+# 尚未同步; 只删除能证明"该路径来自 Windows, 或早于最近一次成功 L→W 就存在"
+# 的路径:
+#   - w2l_landed: 最近一次出现是 W2L 从 Windows 同步过来的 (Windows 来源)
+#   - linux_known: 启动时全量快照 + inotify CREATE/MOVED_TO 增量 (epoch\tpath)
+#   - last_l2w_ok: 最近一次 rc=0 的 L→W 完成时间
+# 无凭证路径一律跳过 (保守)
+# ============================================================================
+propagate_win_deletions() {
+    is_bidirectional || return 0
+    [ "$PROPAGATE_WIN_DELETE" = "true" ] || return 0
+    local proj="$1" ldir="$2" scan="$3"
+    local known_file="$STATE_DIR/$proj/linux_known"
+    [ -s "$known_file" ] || return 0
+    local last_ok=0
+    [ -f "$STATE_DIR/$proj/last_l2w_ok" ] && \
+        last_ok=$(cat "$STATE_DIR/$proj/last_l2w_ok" 2>/dev/null || echo 0)
+
+    if [ -s "$scan" ]; then
         local deleted=0 skipped=0 rel ep w2l_ep
         # W2L 落地台账修剪: 只保留最近 3000 条, 防无限增长
         # (更早的 Windows 来源文件由 last_l2w_ok 凭证规则兜底)
@@ -522,21 +643,10 @@ propagate_win_deletions() {
             else
                 skipped=$((skipped+1))
             fi
-        done < <(grep -E '^\*deleting' "$tmp" 2>/dev/null)
+        done < <(grep -E '^\*deleting' "$scan" 2>/dev/null)
         [ "$deleted" -gt 0 ] && log "$proj" "SYNC" "W→L 删除传播完成: 共删除 ${deleted} 个路径"
         [ "$skipped" -gt 0 ] && log "$proj" "SKIP" "W→L 删除传播: ${skipped} 个候选无凭证, 跳过"
-    else
-        # 失败限流日志 (同 dryrun_w2l_changes)
-        local fail_ts_file="$STATE_DIR/$proj/wdel_fail_ts"
-        local now=$(date +%s) last_fail=0
-        [ -f "$fail_ts_file" ] && last_fail=$(cat "$fail_ts_file" 2>/dev/null || echo 0)
-        if [ $((now - last_fail)) -gt 60 ]; then
-            log "$proj" "ERROR" "W→L 删除检测 dry-run 失败 (exit=$rc)"
-            date +%s > "$fail_ts_file"
-        fi
     fi
-    release_global_lock
-    rm -f "$tmp"
 }
 
 # ============================================================================
@@ -562,8 +672,32 @@ sync_linux_to_win() {
         del_args=(--delete)
     fi
 
-    # 带 --delete 时每次重试前重新预检 dirty 锁 (见 run_rsync_locked)
-    [ ${#del_args[@]} -gt 0 ] && RSYNC_PRECHECK_FN=sync_precheck_dirty
+    # v6.11 安全预检: 带 --delete 前确认 Windows 没有尚未回传的变更.
+    # windows_dirty 只反映"轮询器已经看到"的变更; 排队等锁期间 Windows 新建的
+    # 文件此时还没被轮询发现, 直接带 --delete 会把它删掉 (实测可复现).
+    # 发现变更/扫描失败一律放弃本次 --delete 并挂 dirty (保守降级, 变更不丢).
+    # 仅双向模式需要: 单向模式 Windows 变更本就该被覆盖/删除, 且无人解除 dirty
+    if is_bidirectional && [ ${#del_args[@]} -gt 0 ] && [ "$L2W_DELETE_PRECHECK" = "true" ]; then
+        w2l_clean_check "$proj" "$ldir" "$wdir"
+        case $? in
+            0) : ;;
+            1) del_args=(); : > "$STATE_DIR/$proj/windows_dirty"
+               log "$proj" "WARN" "L→W 安全预检: Windows 有未回传变更, 本次禁用 --delete" ;;
+            *) del_args=(); : > "$STATE_DIR/$proj/windows_dirty"
+               log "$proj" "WARN" "L→W 安全预检失败 (exit=${W2L_CHECK_RC:-?}), 本次禁用 --delete" ;;
+        esac
+    fi
+
+    # 带 --delete 时: 每次重试前重新预检 dirty 锁, 且重试一律降级去掉 --delete
+    # (删除许可只对"预检那一刻"的快照有效, 见 run_rsync_locked 里的说明)
+    RSYNC_DELETE_SKIPPED=0
+    RSYNC_RETRY_DROP_DELETE=""
+    if [ ${#del_args[@]} -gt 0 ]; then
+        RSYNC_PRECHECK_FN=sync_precheck_dirty
+        # 仅双向模式降级: 单向模式没有 W→L, Windows 变更本就该被覆盖/删除,
+        # 降级只会让删除无谓地推迟
+        is_bidirectional && RSYNC_RETRY_DROP_DELETE="true"
+    fi
 
     run_rsync_locked "$proj" "$tmp" \
         -avzi --update "${del_args[@]}" \
@@ -574,6 +708,9 @@ sync_linux_to_win() {
         "$ldir/" "$(ssh_dest):$wdir/"
     rc=$?
     RSYNC_PRECHECK_FN=""
+    RSYNC_RETRY_DROP_DELETE=""
+    [ "$RSYNC_DELETE_SKIPPED" = "1" ] && \
+        log "$proj" "WARN" "L→W 重试降级: 本次未执行删除 (删除留到下次带 --delete 的 L→W 补做)"
 
     if [ $rc -eq 10 ]; then
         # 预检中止: 不更新 last_l2w_ok、不清台账, 直接按失败返回
@@ -591,7 +728,10 @@ sync_linux_to_win() {
         # 若清空发生在它们读取之后、rsync 打开之前, 会报 "failed to open exclude
         # file" (exit 11); 文件一旦创建就保留为空文件, 彻底消除打开竞态
         # (rc=24 部分完成时保守保留, 下次成功再清)
-        [ ${#del_args[@]} -gt 0 ] && : > "$STATE_DIR/$proj/pending_deletes"
+        # v6.11: 重试降级过的运行实际没带 --delete, 台账必须保留 (否则可能被
+        # W→L 复活), 由下次真正执行删除的 L→W 清空
+        [ ${#del_args[@]} -gt 0 ] && [ "$RSYNC_DELETE_SKIPPED" != "1" ] && \
+            : > "$STATE_DIR/$proj/pending_deletes"
     fi
     release_global_lock
 
@@ -814,6 +954,9 @@ linux_watcher() {
                 fi
                 # 写入完成时间戳，W→L 据此判断是否需要等待
                 date +%s > "$STATE_DIR/$proj/l2w_done"
+                # P1 (v6.12): 正常结束后清掉 pid 台账, 使"L→W 在跑"的判断只覆盖
+                # 真实运行时段 (kill -0 存活判断仍兜底异常退出的残留)
+                rm -f "$STATE_DIR/$proj/l2w_pid"
             ) &
             pid=$!
             echo "$pid" > "$STATE_DIR/$proj/l2w_pid"
@@ -844,19 +987,37 @@ windows_watcher() {
 
     sleep 5  # 等待初始 L→W 同步完成
 
+    local poll_yield=0   # P1: 已连续让路的轮数 (扫描一轮即清零)
     while true; do
         sleep 5
 
-        # dry-run 检测 Windows 侧变化 (带全局锁, 只统计 Windows 更新的文件)
+        # P1 (v6.12): L→W 在跑或刚跑完 → 本轮不扫描, 把全局锁让给事件同步.
+        # 空闲时轮询扫描占用几乎全部 rsync 活动与锁时间, 让路后编辑触发的
+        # L→W 不必再排在轮询扫描后面; 连续让路封顶, 之后必扫一次 (W→L 不饿死)
+        if [ "$POLL_YIELD_TO_L2W" = "true" ] && [ "$poll_yield" -lt "$POLL_YIELD_MAX" ] \
+           && l2w_active_recent "$proj" "$POLL_YIELD_GRACE"; then
+            poll_yield=$((poll_yield + 1))
+            log "$proj" "SKIP" "L→W 进行中, 本轮轮询让路 (${poll_yield}/${POLL_YIELD_MAX})"
+            continue
+        fi
+        poll_yield=0
+
+        # 单次持锁扫描 (v6.11): Windows 变更检测 + 删除传播合并为一次全树 dry-run
         local changes
-        dryrun_w2l_changes "$proj" "$ldir" "$wdir"
+        w2l_scan "$proj" "$ldir" "$wdir"
         changes=$DRYRUN_CHANGES
 
         if [ "$changes" -eq 0 ]; then
+            # v6.11 安全修复: dry-run 失败 (rc≠0/24) 时 changes 同样是 0, 但与
+            # "Windows 确认干净" 语义完全不同 — 失败时若解除 windows_dirty,
+            # 随后的 L→W 会带 --delete 删掉 Windows 上尚未回传的新文件
+            # (v6.1 那类误删). 失败一律保留保护锁, 等下一轮扫描确认
+            if [ "$DRYRUN_RC" -ne 0 ] && [ "$DRYRUN_RC" -ne 24 ]; then
+                log "$proj" "WARN" "W→L 检测失败 (exit=$DRYRUN_RC), 保留 windows_dirty 保护锁"
+                continue
+            fi
             # Windows 确认干净: 解除 --delete 保护锁 (也是失败/中断后的恢复路径)
             rm -f "$STATE_DIR/$proj/windows_dirty"
-            # Windows 删除 → Linux 传播 (凭证校验, 全程在锁内)
-            propagate_win_deletions "$proj" "$ldir" "$wdir"
             # 台账残留或需要确认 L→W 时, 主动跑一次 L→W
             # (dry-run 必须成功, 避免离线时误触发)
             if { [ -s "$STATE_DIR/$proj/pending_deletes" ] || [ -f "$STATE_DIR/$proj/need_l2w_confirm" ]; } \
@@ -871,26 +1032,26 @@ windows_watcher() {
             continue
         fi
 
-        # 检测到 Windows 变化: 立即挂 dirty 保护锁 (期间 L→W 禁用 --delete),
-        # 尽早保护, 避免并发触发的 L→W 误删 Windows 新文件
-        : > "$STATE_DIR/$proj/windows_dirty"
-        log "$proj" "EVENT" "检测到 Windows 变化 ($changes 项), 锁定 windows_dirty (L→W --delete 暂时禁用)"
-
-        # 变化期间立即传播 Windows 删除: 否则本周期内由 W→L 回音触发的 L→W
-        # 会把"Windows 已删除、Linux 尚未删除"的文件复制回 Windows,
-        # 使删除被撤销 (见 v6.6)
-        propagate_win_deletions "$proj" "$ldir" "$wdir"
+        # 检测到 Windows 变化: windows_dirty 已由 w2l_scan 在锁内挂上 (期间
+        # L→W 禁用 --delete); Windows 删除传播也已在同一次持锁扫描内完成
+        # (见 v6.6), 因此这里不再单独跑第二次 dry-run
+        log "$proj" "EVENT" "检测到 Windows 变化 ($changes 项), 已锁定 windows_dirty (L→W --delete 暂时禁用)"
 
         # 等待 3 秒后重新确认，避免与 inotify 触发的 L→W 同步竞态
         # 场景：Linux 删除了文件，inotify 还没执行 L→W，但轮询先检测到了差异
         # 如果不等待，W→L 会把 Windows 上尚未被删除的文件复制回 Linux
         sleep 3
-        dryrun_w2l_changes "$proj" "$ldir" "$wdir"
+        w2l_scan "$proj" "$ldir" "$wdir"
         changes=$DRYRUN_CHANGES
 
         if [ "$changes" -eq 0 ]; then
-            rm -f "$STATE_DIR/$proj/windows_dirty"
-            log "$proj" "OK" "变化已由 L→W 处理, 跳过 W→L"
+            # 同首轮: 只有扫描成功才算"变化已由 L→W 处理", 失败时保留保护锁
+            if [ "$DRYRUN_RC" -eq 0 ] || [ "$DRYRUN_RC" -eq 24 ]; then
+                rm -f "$STATE_DIR/$proj/windows_dirty"
+                log "$proj" "OK" "变化已由 L→W 处理, 跳过 W→L"
+            else
+                log "$proj" "WARN" "W→L 检测失败 (exit=$DRYRUN_RC), 保留 windows_dirty 保护锁"
+            fi
             continue
         fi
 
@@ -923,11 +1084,15 @@ windows_watcher() {
         while true; do
             sync_win_to_linux "$proj" "$ldir" "$wdir" || break
 
-            dryrun_w2l_changes "$proj" "$ldir" "$wdir"
+            w2l_scan "$proj" "$ldir" "$wdir"
             changes=$DRYRUN_CHANGES
 
             if [ "$changes" -eq 0 ]; then
-                rm -f "$STATE_DIR/$proj/windows_dirty"
+                if [ "$DRYRUN_RC" -eq 0 ] || [ "$DRYRUN_RC" -eq 24 ]; then
+                    rm -f "$STATE_DIR/$proj/windows_dirty"
+                else
+                    log "$proj" "WARN" "W→L 检测失败 (exit=$DRYRUN_RC), 保留 windows_dirty 保护锁"
+                fi
                 break
             fi
             ((loop++))
@@ -1005,7 +1170,7 @@ cleanup() {
 }
 trap cleanup SIGINT SIGTERM
 
-log "MAIN" "INIT" "========== v6.10 启动 (PID: $$) =========="
+log "MAIN" "INIT" "========== v6.12 启动 (PID: $$) =========="
 log "MAIN" "INIT" "模式: $(is_bidirectional && echo '双向 Linux ⇄ Windows' || echo '单向 Linux → Windows')"
 log "MAIN" "INIT" "项目数: ${#PROJECT_NAMES[@]}"
 
